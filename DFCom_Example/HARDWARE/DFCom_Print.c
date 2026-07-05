@@ -66,8 +66,8 @@ void Odom_PrintTimer_Init(void)
  *   1. g_local_tick_ms++ (给 WaitMoveDone 等用)
  *   2. 每 100ms (= 10Hz) 调一次打印
  *
- * ★ 默认打印 VelPos (初学者版, 字段少看起来清爽)
- * ★ 想看完整版 (含 roll/pitch/acc/gyro), 取消 Odom_Print() 那行的注释
+ * ★ 默认打印 Odom v4。部分底盘固件只推 Odom v4, 不推 VelPos v2。
+ * ★ 如果确认底盘会推 VelPos v2, 可以改成 VelPos_Print() 看简化字段。
  * ===========================================================================*/
 void TIM2_IRQHandler(void)
 {
@@ -78,8 +78,8 @@ void TIM2_IRQHandler(void)
 
         /* 10Hz 打印 */
         if (g_print_odom_enable && (g_local_tick_ms % 100) == 0) {
-            VelPos_Print();   /* 简化版 (默认) */
-            // Odom_Print();  /* 全量进阶版 (默认注释; 取消注释即可看完整数据) */
+            Odom_Print();     /* 全量版 (默认, 兼容只推 Odom v4 的底盘) */
+            // VelPos_Print(); /* 简化版 (仅底盘推 VelPos v2 时使用) */
         }
     }
 }
