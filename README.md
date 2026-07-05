@@ -69,6 +69,12 @@ No flow control
 2. STM32F103C8 对应的 STM32F1 Device Family Pack，例如 `Keil.STM32F1xx_DFP.2.4.1.pack`。
 3. Keil 工程中启用 `Use MicroLIB`，否则 `printf` 重定向可能无法正常输出。
 
+ARM Compiler 5 和 STM32F103C8 芯片包获取链接：
+
+https://ucnerk2uhr85.feishu.cn/wiki/BaUMwzR4liGc6FkMES1c64c6nOb?renamingWikiNode=true#share-APaqdPwYPo1PIhxCeiac3fzJnih
+
+打开链接后请耐心等待约 5 秒，页面会自动跳转到对应位置。
+
 打开工程：
 
 ```text
@@ -270,3 +276,7 @@ Release 中提供两份例程包：
 - `DCar-STM32F103C8-Makefile.zip`: macOS Makefile / arm-none-eabi-gcc 版本。
 
 编译器安装包、Keil MDK 安装包、芯片 Pack 等第三方工具请从对应官方渠道获取并按授权使用。
+
+如需 ARM Compiler 5 和 STM32F103C8 芯片包，请打开下面链接，打开后耐心等待约 5 秒，页面会自动跳转到对应位置：
+
+https://ucnerk2uhr85.feishu.cn/wiki/BaUMwzR4liGc6FkMES1c64c6nOb?renamingWikiNode=true#share-APaqdPwYPo1PIhxCeiac3fzJnih
