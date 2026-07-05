@@ -111,7 +111,7 @@ void TIM2_IRQHandler(void)
  *                ↑ B 系速度: 车正以 0.2 m/s 向自己前方走
  *
  * ★ 调用方式
- *   订阅: send Cmd_Subscribe_Odom(...) → 同时点亮 Odom v4 + VelPos v2 两条帧
+ *   订阅: send Cmd_Subscribe_VelPos(...) → 小车持续推 VelPos v2 帧
  *   收到至少一帧才会打印 (frame_count > 0), 避免开机刷一堆 0。
  * ===========================================================================*/
 void VelPos_Print(void)
@@ -126,7 +126,7 @@ void VelPos_Print(void)
     snap.frame_count  = g_velpos.frame_count;
 
     if (snap.frame_count == 0) {
-        printf("[VELPOS] (no data yet, send Cmd_Subscribe_Odom?)\r\n");
+        printf("[VELPOS] (no data yet, send Cmd_Subscribe_VelPos?)\r\n");
         return;
     }
 

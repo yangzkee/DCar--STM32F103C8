@@ -130,7 +130,7 @@ make flash-openocd
 make OPENOCD_INTERFACE=interface/cmsis-dap.cfg flash-openocd
 ```
 
-## Odom 数据显示逻辑
+## VelPos 数据显示逻辑
 
 例程启动后会初始化：
 
@@ -140,13 +140,13 @@ usart2_init(115200);        // USART2 接电脑 USB-TTL
 Odom_PrintTimer_Init();     // TIM2 10Hz 自动打印
 ```
 
-随后通过启动诊断函数发送 Odom 订阅请求：
+随后通过启动诊断函数发送 VelPos 订阅请求：
 
 ```c
-Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
 ```
 
-小车收到订阅请求后持续回传数据。STM32 使用 USART1 DMA + IDLE 中断接收，`DFCom_RxParse()` 自动解析数据，并写入：
+小车收到订阅请求后持续回传 VelPos v2 数据。STM32 使用 USART1 DMA + IDLE 中断接收，`DFCom_RxParse()` 自动解析数据，并写入：
 
 ```c
 g_odom
@@ -198,9 +198,10 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile);
 - `Cmd_Move_Arc`: 圆弧运动。
 - `profile`: `0` 匀速，`1` 梯形加减速。
 
-### Odom 和状态
+### VelPos / Odom 和状态
 
 ```c
+void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz);
 void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz);
 void Cmd_Query_DcarState(void);
 u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms);
@@ -209,7 +210,8 @@ u8 GetMoveProgress(u8 cmd_code);
 
 说明：
 
-- `Cmd_Subscribe_Odom`: 订阅 Odom / VelPos 数据。
+- `Cmd_Subscribe_VelPos`: 默认使用，订阅 VelPos v2 简化数据。
+- `Cmd_Subscribe_Odom`: 订阅 Odom v4 全量数据。
 - `Cmd_Query_DcarState`: 查询小车激活、IMU 校准、控制参数状态。
 - `WaitMoveDone`: 等待运动完成，推荐 `timeout_ms = 0`。
 - `GetMoveProgress`: 非阻塞读取运动进度。

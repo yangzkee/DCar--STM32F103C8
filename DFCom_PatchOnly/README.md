@@ -50,7 +50,7 @@ DFCom_Example/
 5. PC 打开串口工具（115200 8N1）接 USB-TTL 那个 COM 口
 6. 上电，终端就能看到：
    ```
-   [INIT] Subscribe ODOM @ 10Hz...
+   [INIT] Subscribe VelPos @ 10Hz...
    [INIT] ODOM data flowing ✓ (got 15 frames in 1.5s)
    [ODOM] Yaw=  0.12 X(fwd)=  0.000 Y(left)=  0.000 Vx(fwd)=  0.00 Vy(left)=  0.00 Gz=  0.01 fr=1
    [ODOM] Yaw=  0.15 X(fwd)=  0.024 Y(left)=  0.000 Vx(fwd)=  0.25 Vy(left)=  0.00 Gz=  0.02 fr=2
@@ -145,16 +145,17 @@ void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);
 /* 圆弧；profile: 0=匀速, 1=梯形加减速（推荐） */
 void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);
 
-/* 订阅 ODOM 数据 */
-void Cmd_Subscribe_Odom     (u8 mode, u8 freq_hz);
+/* 订阅 VelPos / Odom 数据 */
+void Cmd_Subscribe_VelPos   (u8 mode, u8 freq_hz);  // 默认
+void Cmd_Subscribe_Odom     (u8 mode, u8 freq_hz);  // 全量 Odom
 ```
 
 ### ODOM 订阅模式
 
 ```c
-Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, 10);  // ★持续模式，10Hz（最常用）
-Cmd_Subscribe_Odom(ODOM_MODE_ONESHOT,    1);   // 拍一帧快照
-Cmd_Subscribe_Odom(ODOM_MODE_STOP,       0);   // 停止推送
+Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, 10);  // ★持续模式，10Hz（默认）
+Cmd_Subscribe_VelPos(ODOM_MODE_ONESHOT,    1);   // 拍一帧快照
+Cmd_Subscribe_VelPos(ODOM_MODE_STOP,       0);   // 停止推送
 ```
 
 **重要**：持续模式下小车收到一次订阅就会自己一直推送，**客户端不需要反复发请求**！
@@ -250,11 +251,11 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 - 检查 USB-TTL 波特率是不是 115200
 - 检查 Keil 是不是勾了 Use MicroLIB（printf 不行就是这个问题）
 
-**Q: 终端有 `[INIT] Subscribe ODOM` 但没有 `[ODOM]` 数据**
+**Q: 终端有 `[INIT] Subscribe VelPos` 但没有 `[VELPOS]` 数据**
 - 检查 USART1 (PA9/PA10) 接小车的线
 - 检查小车有没有上电、有没有激活（未激活的话 OLED 显示"未激活"，需要先用上位机激活）
 
-**Q: 看到 `[ODOM] (no data yet...)` 一直循环**
+**Q: 看到 `[VELPOS] (no data yet...)` 一直循环**
 - 一样是 USART1 接线问题，或者小车没在跑
 
 **Q: 小车不动 / 动作不对**
@@ -280,7 +281,7 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 | 想看什么 | 看哪里 |
 |---|---|
 | 5 条 Cmd_Move_* 的帧布局 + 字段偏移 + 缩放 | `HARDWARE/DFCom_Tx.c` 每个函数前面的大块注释 |
-| 订阅 / 状态查询的协议含义 | `HARDWARE/DFCom_Tx.c::Cmd_Subscribe_Odom / Cmd_Query_DcarState` |
+| 订阅 / 状态查询的协议含义 | `HARDWARE/DFCom_Tx.c::Cmd_Subscribe_VelPos / Cmd_Subscribe_Odom / Cmd_Query_DcarState` |
 | Odom v4 / VelPos v2 payload 布局与缩放 | `HARDWARE/DFCom_Rx.c::parse_odom_v4 / parse_velpos_v2` 顶部注释 |
 | ProgressBack / DcarState 解析 | `HARDWARE/DFCom_Rx.c::parse_move_progress / parse_dcar_state` |
 | 帧定界 + 校验和 + 分发逻辑 | `HARDWARE/DFCom_Rx.c::DFCom_RxParse` |
@@ -318,7 +319,7 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 ============================================
 [INIT] USART1 = 460800 (to DcarON)
 [INIT] USART2 = 115200 (this terminal)
-[INIT] Subscribe ODOM @ 10Hz...
+[INIT] Subscribe VelPos @ 10Hz...
 [INIT] Query DcarState...
 [INIT] DcarState: imu_calibrated=1, finetune=1, par1=1.00 par2=1.00
 [INIT] Waiting 1500ms to check ODOM flow...

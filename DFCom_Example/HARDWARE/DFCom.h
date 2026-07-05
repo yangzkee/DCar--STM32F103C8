@@ -63,12 +63,12 @@
 #define CMD_LINEAR_WITH_YAW  0x65       /* Motion_LinearWithYaw - 平移+yaw（无头） */
 #define CMD_ARC              0x66       /* Motion_Arc        - 圆弧 */
 
-/* ODOM 订阅模式（Cmd_Subscribe_Odom 第一个参数） */
+/* 周期数据订阅模式（Cmd_Subscribe_Odom / Cmd_Subscribe_VelPos 第一个参数） */
 #define ODOM_MODE_CONTINUOUS 0x01       /* ★ 持续发送（最常用，发一次后小车自己 N Hz 推） */
 #define ODOM_MODE_ONESHOT    0x02       /* 只发一次（用来"拍一帧"快照） */
 #define ODOM_MODE_STOP       0x00       /* 停止发送（内部转成 ONESHOT 实现：发一次后小车自动停）*/
 
-/* ODOM 订阅频率（Cmd_Subscribe_Odom 第二个参数，单位 Hz）
+/* 周期数据订阅频率（第二个参数，单位 Hz）
  * 小车端只接受这 7 个固定频率，其他值会被默默 fallback 到 10Hz: */
 #define ODOM_FREQ_10HZ       10         /* 推荐：肉眼能看清屏幕滚动 */
 #define ODOM_FREQ_50HZ       50         /* 做闭环用 */
@@ -280,12 +280,13 @@ void Cmd_Move_Rot           (float dyaw_rad, float omega_max_rad_s);            
 void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);           /* 0x62 持续速度（无完成回传） */
 void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);      /* 0x66 圆弧 */
 
-/* ODOM 订阅：发一次小车就持续发送
+/* 周期数据订阅：发一次小车就持续发送
  *   mode: ODOM_MODE_CONTINUOUS / ODOM_MODE_ONESHOT / ODOM_MODE_STOP
  *   freq_hz: 10/50/100/200/250/500（小车协议枚举，其他自动 fallback 到 10）
- * 教学常用：Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+ * 教学常用：Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
  */
 void Cmd_Subscribe_Odom (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz);
 
 /* 查询小车激活/校准状态（启动诊断用）
  * 发完后等 100~500ms，读 g_dcar_state.received/imu_calibrated

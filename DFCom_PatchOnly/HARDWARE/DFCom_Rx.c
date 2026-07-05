@@ -49,7 +49,8 @@
 /* ===========================================================================
  * 全局数据存储 —— 应用层直接读
  * ===========================================================================*/
-volatile OdomData_t   g_odom         = {0};
+volatile OdomData_t   g_odom         = {0};   /* Odom v4 (CMD 0x6C 0x80, 51B) */
+volatile VelPosData_t g_velpos       = {0};   /* VelPos v2 (CMD 0x6C 0x81, 35B) */
 volatile MoveStatus_t g_move_status[8] = {{0}};
 volatile DcarState_t  g_dcar_state   = {0};
 
@@ -73,55 +74,136 @@ static u32 read_u32(const u8 *p) {
 
 
 /*============================================================================
- *  解析 1：IMU_TIME 数据帧 (A=0x6C, B=0x80)
+ *  共享 scale 表 (跟小车端 DF_link.h 完全一致)
  *  ──────────────────────────────────────────────────────────────────────────
- *  payload 36 字节，布局如下（小车端编码见 DF_CoreState.c::DF_IMU_TIME）：
- *
- *    偏移      字段      类型     缩放     含义 (ROS REP-103: +X 前, +Y 左)
- *    ────      ───────   ──────  ──────   ────────────────────────────────
- *    [0..1]    Acc_X     s16 LE   ×100    加速度 +X 前 (m/s²)
- *    [2..3]    Acc_Y     s16 LE   ×100    加速度 +Y 左
- *    [4..5]    Acc_Z     s16 LE   ×100    加速度 +Z 上
- *    [6..7]    Gyro_X    s16 LE   ×100    角速度 X (rad/s)
- *    [8..9]    Gyro_Y    s16 LE   ×100    角速度 Y
- *    [10..11]  Gyro_Z    s16 LE   ×100    角速度 Z, CCW+
- *    [12..15]  Yaw       s32 LE   ×10000  ★ Yaw (弧度 rad, 连续累计, CCW+) ★
- *                                          ↑ 协议层 SI rad, 不再 deg!
- *                                          ↑ 分辨率 1/10000 rad ≈ 0.0057°
- *    [16..17]  B_VelX    s16 LE   ×100    车体系 Vx +前 (m/s)
- *    [18..19]  B_VelY    s16 LE   ×100    车体系 Vy +左 (m/s)
- *    [20..23]  N_PosX    s32 LE   ×10000  ★ 世界系 +X 前进 位置 (米) ★
- *    [24..27]  N_PosY    s32 LE   ×10000  ★ 世界系 +Y 左方 位置 (米) ★
- *    [28..31]  Time_Int  u32 LE   --      小车端时间戳（秒部分）
- *    [32..35]  Time_Dec  u32 LE   --      小车端时间戳（微秒部分）
- *
- *  → 解析到 g_odom；frame_count 自增以便诊断"数据是否在流动"
+ *  物理量          | scale  | 量程        | 精度
+ *  --------------- |--------|-------------|----------
+ *  角度 (rad)      | 10000  | ±3.276 rad  | 0.0057°
+ *  加速度 (m/s²)   |   400  | ±8.36g      | 0.0025 m/s²
+ *  角速度 (rad/s)  |  1800  | ±1043°/s    | 0.032°/s
+ *  速度 (m/s)      |  5000  | ±6.55 m/s   | 0.0002 m/s
+ *  位置 (m, s32)   |  1000  | ±2147 km    | 1 mm
  *============================================================================*/
-static void parse_imu_time(const u8 *payload, u8 payload_len)
+#define DFCOM_SCALE_ANGLE_RAD   10000.0f
+#define DFCOM_SCALE_ACC_MPS2      400.0f
+#define DFCOM_SCALE_GYRO_RAD     1800.0f
+#define DFCOM_SCALE_VEL_MPS      5000.0f
+#define DFCOM_SCALE_POS_M        1000.0f
+
+/*============================================================================
+ *  解析 1：Odom v4 数据帧 (A=0x6C, B=0x80, 51B payload)
+ *  ──────────────────────────────────────────────────────────────────────────
+ *  全量状态: roll/pitch/yaw + acc + gyro + vel(body/world) + pos(world) + ts
+ *  小车端发起: DF_CoreState.c::DF_IMU_TIME
+ *
+ *    偏移      字段           类型     scale    含义
+ *    ────      ───────────    ──────  ───────  ─────────────────────────────
+ *    [0]       version        u8       --       0x04 (协议版本)
+ *    [1..2]    roll_rad       s16 LE   ×10000  ROS roll (FLU)
+ *    [3..4]    pitch_rad      s16 LE   ×10000  ROS pitch (FLU)
+ *    [5..6]    yaw_rad        s16 LE   ×10000  ROS yaw (wrap [-π,π])
+ *    [7..8]    acc_x          s16 LE   ×400    m/s² (specific force)
+ *    [9..10]   acc_y          s16 LE   ×400    m/s²
+ *    [11..12]  acc_z          s16 LE   ×400    m/s² (静止 ≈ +9.81)
+ *    [13..14]  gyro_x         s16 LE   ×1800   rad/s
+ *    [15..16]  gyro_y         s16 LE   ×1800   rad/s
+ *    [17..18]  gyro_z         s16 LE   ×1800   rad/s (CCW+)
+ *    [19..20]  vel_body_x     s16 LE   ×5000   m/s
+ *    [21..22]  vel_body_y     s16 LE   ×5000   m/s
+ *    [23..24]  vel_body_z     s16 LE   ×5000   m/s
+ *    [25..26]  vel_world_x    s16 LE   ×5000   m/s
+ *    [27..28]  vel_world_y    s16 LE   ×5000   m/s
+ *    [29..30]  vel_world_z    s16 LE   ×5000   m/s
+ *    [31..34]  pos_world_x    s32 LE   ×1000   m
+ *    [35..38]  pos_world_y    s32 LE   ×1000   m
+ *    [39..42]  pos_world_z    s32 LE   ×1000   m
+ *    [43..46]  timestamp_ms   u32 LE   --      启动后毫秒数
+ *    [47..50]  timestamp_us   u32 LE   --      毫秒下的微秒部分
+ *============================================================================*/
+static void parse_odom_v4(const u8 *payload, u8 payload_len)
 {
-    if (payload_len < 36) return;  /* 长度不对直接丢 (新协议 36B, 旧 34B 兼容性已断) */
+    if (payload_len < 51) return;
+    if (payload[0] != 0x04) return;  /* version 字节检查 */
 
-    g_odom.acc_x_mps2  = read_s16(&payload[0])  / 100.0f;
-    g_odom.acc_y_mps2  = read_s16(&payload[2])  / 100.0f;
-    g_odom.acc_z_mps2  = read_s16(&payload[4])  / 100.0f;
-    g_odom.gyro_x_rps  = read_s16(&payload[6])  / 100.0f;
-    g_odom.gyro_y_rps  = read_s16(&payload[8])  / 100.0f;
-    g_odom.gyro_z_rps  = read_s16(&payload[10]) / 100.0f;
+    g_odom.roll_rad    = read_s16(&payload[1])  / DFCOM_SCALE_ANGLE_RAD;
+    g_odom.pitch_rad   = read_s16(&payload[3])  / DFCOM_SCALE_ANGLE_RAD;
+    g_odom.yaw_rad     = read_s16(&payload[5])  / DFCOM_SCALE_ANGLE_RAD;
 
-    /* Yaw: rad s32×10000 (4B), 原来是 deg s16×100 (2B) */
-    g_odom.yaw_rad     = read_s32(&payload[12]) / 10000.0f;
-    g_odom.b_vel_x_mps = read_s16(&payload[16]) / 100.0f;
-    g_odom.b_vel_y_mps = read_s16(&payload[18]) / 100.0f;
+    g_odom.acc_x_mps2  = read_s16(&payload[7])  / DFCOM_SCALE_ACC_MPS2;
+    g_odom.acc_y_mps2  = read_s16(&payload[9])  / DFCOM_SCALE_ACC_MPS2;
+    g_odom.acc_z_mps2  = read_s16(&payload[11]) / DFCOM_SCALE_ACC_MPS2;
 
-    g_odom.n_pos_x_m   = read_s32(&payload[20]) / 10000.0f;
-    g_odom.n_pos_y_m   = read_s32(&payload[24]) / 10000.0f;
+    g_odom.gyro_x_rps  = read_s16(&payload[13]) / DFCOM_SCALE_GYRO_RAD;
+    g_odom.gyro_y_rps  = read_s16(&payload[15]) / DFCOM_SCALE_GYRO_RAD;
+    g_odom.gyro_z_rps  = read_s16(&payload[17]) / DFCOM_SCALE_GYRO_RAD;
 
-    g_odom.car_time_int_s  = read_u32(&payload[28]);
-    g_odom.car_time_dec_us = read_u32(&payload[32]);
+    g_odom.b_vel_x_mps = read_s16(&payload[19]) / DFCOM_SCALE_VEL_MPS;
+    g_odom.b_vel_y_mps = read_s16(&payload[21]) / DFCOM_SCALE_VEL_MPS;
+    g_odom.b_vel_z_mps = read_s16(&payload[23]) / DFCOM_SCALE_VEL_MPS;
+
+    g_odom.n_vel_x_mps = read_s16(&payload[25]) / DFCOM_SCALE_VEL_MPS;
+    g_odom.n_vel_y_mps = read_s16(&payload[27]) / DFCOM_SCALE_VEL_MPS;
+    g_odom.n_vel_z_mps = read_s16(&payload[29]) / DFCOM_SCALE_VEL_MPS;
+
+    g_odom.n_pos_x_m   = read_s32(&payload[31]) / DFCOM_SCALE_POS_M;
+    g_odom.n_pos_y_m   = read_s32(&payload[35]) / DFCOM_SCALE_POS_M;
+    g_odom.n_pos_z_m   = read_s32(&payload[39]) / DFCOM_SCALE_POS_M;
+
+    g_odom.car_time_int_s  = read_u32(&payload[43]);
+    g_odom.car_time_dec_us = read_u32(&payload[47]);
 
     g_odom.local_tick_ms = g_local_tick_ms;
     g_odom.frame_count++;
     g_odom.fresh = 1;
+}
+
+/*============================================================================
+ *  解析 2：VelPos v2 数据帧 (A=0x6C, B=0x81, 35B payload)
+ *  ──────────────────────────────────────────────────────────────────────────
+ *  简化版: 只有 yaw + vel(body/world) + pos(world) + ts (无 roll/pitch/acc/gyro)
+ *  小车端发起: DF_CoreState.c::DF_VelPos_v2
+ *
+ *    偏移      字段           类型     scale    含义
+ *    ────      ───────────    ──────  ───────  ─────────────────────────────
+ *    [0]       version        u8       --       0x02 (协议版本)
+ *    [1..2]    yaw_rad        s16 LE   ×10000  ROS yaw (CCW+)
+ *    [3..4]    vel_body_x     s16 LE   ×5000   m/s
+ *    [5..6]    vel_body_y     s16 LE   ×5000   m/s
+ *    [7..8]    vel_body_z     s16 LE   ×5000   m/s
+ *    [9..10]   vel_world_x    s16 LE   ×5000   m/s
+ *    [11..12]  vel_world_y    s16 LE   ×5000   m/s
+ *    [13..14]  vel_world_z    s16 LE   ×5000   m/s
+ *    [15..18]  pos_world_x    s32 LE   ×1000   m
+ *    [19..22]  pos_world_y    s32 LE   ×1000   m
+ *    [23..26]  pos_world_z    s32 LE   ×1000   m
+ *    [27..30]  timestamp_ms   u32 LE   --      启动后毫秒数
+ *    [31..34]  timestamp_us   u32 LE   --      毫秒下的微秒部分
+ *============================================================================*/
+static void parse_velpos_v2(const u8 *payload, u8 payload_len)
+{
+    if (payload_len < 35) return;
+    if (payload[0] != 0x02) return;  /* version 字节检查 */
+
+    g_velpos.yaw_rad     = read_s16(&payload[1])  / DFCOM_SCALE_ANGLE_RAD;
+
+    g_velpos.b_vel_x_mps = read_s16(&payload[3])  / DFCOM_SCALE_VEL_MPS;
+    g_velpos.b_vel_y_mps = read_s16(&payload[5])  / DFCOM_SCALE_VEL_MPS;
+    g_velpos.b_vel_z_mps = read_s16(&payload[7])  / DFCOM_SCALE_VEL_MPS;
+
+    g_velpos.n_vel_x_mps = read_s16(&payload[9])  / DFCOM_SCALE_VEL_MPS;
+    g_velpos.n_vel_y_mps = read_s16(&payload[11]) / DFCOM_SCALE_VEL_MPS;
+    g_velpos.n_vel_z_mps = read_s16(&payload[13]) / DFCOM_SCALE_VEL_MPS;
+
+    g_velpos.n_pos_x_m   = read_s32(&payload[15]) / DFCOM_SCALE_POS_M;
+    g_velpos.n_pos_y_m   = read_s32(&payload[19]) / DFCOM_SCALE_POS_M;
+    g_velpos.n_pos_z_m   = read_s32(&payload[23]) / DFCOM_SCALE_POS_M;
+
+    g_velpos.car_time_int_s  = read_u32(&payload[27]);
+    g_velpos.car_time_dec_us = read_u32(&payload[31]);
+
+    g_velpos.local_tick_ms = g_local_tick_ms;
+    g_velpos.frame_count++;
+    g_velpos.fresh = 1;
 }
 
 
@@ -258,9 +340,8 @@ void DFCom_RxParse(u8 *data, u16 size)
         payload = &data[hdr + 6];
         switch (A) {
             case 0x6C:   /* 周期数据回传 */
-                if (B == 0x80) parse_imu_time(payload, len);
-                /* 其他 0x6C 子码（B_Vel/N_Vel/B_Pos/N_Pos 等）信息全在 IMU_TIME 里
-                 * 都有了，不重复解析 */
+                if (B == 0x80) parse_odom_v4(payload, len);    /* Odom v4 全量 51B */
+                else if (B == 0x81) parse_velpos_v2(payload, len); /* VelPos v2 简化 35B */
                 break;
 
             case 0x6F:   /* 运动完成/进度回传 */

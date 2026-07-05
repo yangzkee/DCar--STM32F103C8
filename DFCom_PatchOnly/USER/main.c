@@ -56,14 +56,14 @@
  *       ============================================
  *       [INIT] USART1 = 460800 (to DcarON)
  *       [INIT] USART2 = 115200 (this terminal)
- *       [INIT] Subscribe ODOM @ 10Hz...
+ *       [INIT] Subscribe VelPos @ 10Hz...
  *       [INIT] Query DcarState...
  *       [INIT] DcarState: imu_calibrated=1, finetune=1, par1=1.00 par2=1.00
- *       [INIT] ODOM data flowing ✓ (frame_count=15 in 1500ms)
+ *       [INIT] VelPos data flowing ✓ (frame_count=15 in 200ms)
  *       [INIT] ✓ All OK, sending commands...
  *
- *       [ODOM] Yaw=  0.12 X(fwd)=  0.000 Y(left)=  0.000 ... fr=15
- *       [ODOM] Yaw=  0.13 X(fwd)=  0.024 Y(left)=  0.000 ... fr=16
+ *       [VELPOS] Yaw=  0.12 X(N,fwd)=  0.000 Y(N,left)=  0.000 ... fr=15
+ *       [VELPOS] Yaw=  0.13 X(N,fwd)=  0.024 Y(N,left)=  0.000 ... fr=16
  *       ...
  *
  *
@@ -118,7 +118,7 @@
  *      delay_ms(3000);                // 粗暴等 3 秒
  *
  *  🟡 进阶 (等小车真到位):
- *      Cmd_Move_Linear(50, 0, 30, 1);  // 第 4 参 profile: 0=匀速, 1=加减速 (推荐)
+ *      Cmd_Move_Linear(50, 0, 30, 1); // 第 4 参 profile: 0=匀速, 1=加减速 (推荐)
  *      WaitMoveDone(CMD_LINEAR, 0);    // ★ 第二参 0 = 永久等待 (推荐!)
  *                                      //   传 0 = 一直等到 MCU 真正回传完成
  *                                      //   不要设小的超时 (e.g. 5000ms), 会触发"雪崩吃单" bug
@@ -144,7 +144,7 @@
  *  ❌ 终端啥都不输出
  *     → USB-TTL 接错 PA2/PA3？波特率不是 115200？Keil 没勾 Use MicroLIB？
  *
- *  ❌ 看到 INIT 输出但 [INIT] ✗ NO ODOM data
+ *  ❌ 看到 INIT 输出但 [INIT] ✗ NO VELPOS data
  *     → PA9/PA10 接小车的线没接？小车没上电？小车 USART1 不是 460800？
  *
  *  ❌ 看到 [INIT] ✗ DcarState query timeout
@@ -166,6 +166,7 @@
 #include "usart.h"
 #include "delay.h"
 #include "DFCom.h"
+#include "system_stm32f10x.h"
 
 /* M_PI 在 Keil C90 默认未定义，自己声明 */
 #ifndef M_PI
@@ -181,13 +182,14 @@ static void System_Init(void)
     delay_init();
     uart_init(460800);          /* USART1 → DcarON */
     usart2_init(115200);        /* USART2 → printf 终端 */
-    Odom_PrintTimer_Init();     /* TIM2: 维护本地 ms tick + 10Hz 自动打 ODOM */
-
-    /* ★ 单位模式: 默认 DFCOM_UNIT_CM (厘米 + 度, 学生友好)
-     * 想用 SI 单位 (米 + rad)? 把下面这行注释打开: */
-    // g_dfcom_unit_mode = DFCOM_UNIT_M;
+    Odom_PrintTimer_Init();     /* TIM2: 维护本地 ms tick + 10Hz 自动打印 VelPos */
+    /* ★ 单位模式默认 CM (厘米 + 度)
+     * 如需切换, 看 main() 里的 "★★ 单位切换 ★★" 那一段 */
 }
 
+/* ===========================================================================
+ * 启动诊断 —— 帮学生快速发现接线/激活/校准问题
+ * ===========================================================================*/
 /* ★ 启动诊断函数 — 可注释掉
  * ──────────────────────────────────────────────────────────────────────
  * 这是给学生用的"自检流程", 帮你快速发现接线/激活/通信问题。
@@ -196,16 +198,17 @@ static void System_Init(void)
  * 如果你已经确认接线正常 / 小车已激活, 这一步是可选的:
  *   在 main() 里把 Startup_Diagnose() 这一行注释掉即可, 直接进 while(1) 发指令。
  *
- * 等待时间已尽可能压缩, 总耗时 ~500ms (原来 ~3 秒)。
- *
- * (PatchOnly 版只检查 g_odom.frame_count; DFCom_Example 完整版同时检查 g_velpos)
- * ===========================================================================*/
+ * 等待时间已尽可能压缩:
+ *   - 订阅后等 200ms (1~2 帧 10Hz 推回来) 确认链路
+ *   - DcarState 查询超时 200ms (实际通常 5~30ms 就回来)
+ *   - 总耗时 ~500ms, 比之前 (~3 秒) 短得多
+ */
 static void Startup_Diagnose(void)
 {
     u32 t0;
-    u32 fc_before;
-    u32 fc_after;
-    u32 fc_diff;
+    u32 fc_odom_before,   fc_odom_after;
+    u32 fc_velpos_before, fc_velpos_after;
+    u32 diff_odom, diff_velpos;
 
     printf("\r\n");
     printf("============================================\r\n");
@@ -215,10 +218,18 @@ static void Startup_Diagnose(void)
     printf("============================================\r\n");
     printf("[INIT] USART1 = 460800 (to DcarON)\r\n");
     printf("[INIT] USART2 = 115200 (this terminal)\r\n");
+    printf("[CLK] SystemCoreClock=%lu\r\n", (unsigned long)SystemCoreClock);
+    printf("[CLK] RCC->CFGR=0x%08lX RCC->CR=0x%08lX\r\n",
+           (unsigned long)RCC->CFGR,
+           (unsigned long)RCC->CR);
+    printf("[CLK] SWS=0x%02lX HSERDY=%lu PLLRDY=%lu\r\n",
+           (unsigned long)((RCC->CFGR & RCC_CFGR_SWS) >> 2),
+           (unsigned long)(((RCC->CR & RCC_CR_HSERDY) != 0) ? 1 : 0),
+           (unsigned long)(((RCC->CR & RCC_CR_PLLRDY) != 0) ? 1 : 0));
 
-    /* 步骤 1：订阅 ODOM（持续 10Hz）—— 之后小车会自己 10Hz 推数据 */
-    printf("[INIT] Subscribe ODOM @ 10Hz...\r\n");
-    Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+    /* 步骤 1：订阅 VelPos（持续 10Hz）—— 之后小车会自己 10Hz 推 VelPos v2 数据 */
+    printf("[INIT] Subscribe VelPos @ 10Hz...\r\n");
+    Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
     delay_ms(150);   /* 等 ~1.5 帧, 让链路稳定 */
 
     /* 步骤 2：查询小车状态（IMU 校准 / 控制参数）*/
@@ -252,26 +263,30 @@ static void Startup_Diagnose(void)
         printf("[INIT]    3. 小车有没有上电、是不是 460800 bps\r\n");
     }
 
-    /* 步骤 3：等 200ms 看 ODOM 流是否在动 (原来 1500ms 太久了, 200ms 足够 2 帧)
-     * 注意: PatchOnly 没有 VelPos 解析, 这里只能检查 g_odom.frame_count。
-     * 如果你的小车订阅时只推 VelPos v2, 这里会误报 NO ODOM data, 但实际链路是通的。
-     * 想完整支持双帧检查, 用 DFCom_Example 那个版本。 */
-    printf("[INIT] Waiting 200ms to check ODOM flow...\r\n");
-    fc_before = g_odom.frame_count;
-    delay_ms(200);
-    fc_after  = g_odom.frame_count;
-    fc_diff   = fc_after - fc_before;
+    /* 步骤 3：等 200ms 看 VelPos 流是否在动 */
+    printf("[INIT] Waiting 200ms to check VelPos flow...\r\n");
+    fc_odom_before   = g_odom.frame_count;
+    fc_velpos_before = g_velpos.frame_count;
+    delay_ms(200);   /* 10Hz × 0.2s ≈ 2 帧, 足够确认链路 (原来 1500ms 太久了) */
+    fc_odom_after   = g_odom.frame_count;
+    fc_velpos_after = g_velpos.frame_count;
+    diff_odom   = fc_odom_after   - fc_odom_before;
+    diff_velpos = fc_velpos_after - fc_velpos_before;
 
-    if (fc_diff > 0) {
-        printf("[INIT] ODOM data flowing ✓ (got %lu frames in 200ms)\r\n",
-               (unsigned long)fc_diff);
+    if (diff_velpos > 0) {
+        printf("[INIT] VelPos data flowing ✓ (frame_count +%lu in 200ms)\r\n",
+               (unsigned long)diff_velpos);
         printf("[INIT] ✓ All OK, sending commands...\r\n");
     } else {
-        printf("[INIT] ✗ NO ODOM data!\r\n");
-        printf("[INIT]   小车没在推数据 -- 可能原因:\r\n");
+        printf("[INIT] ✗ NO VELPOS data!\r\n");
+        if (diff_odom > 0) {
+            printf("[INIT]   Note: Odom v4 is flowing (+%lu), but VelPos v2 is not.\r\n",
+                   (unsigned long)diff_odom);
+        }
+        printf("[INIT]   小车没在推 VelPos -- 可能原因:\r\n");
         printf("[INIT]    1. 接线问题 (同上)\r\n");
         printf("[INIT]    2. 小车未激活 (上位机软件激活后再试)\r\n");
-        printf("[INIT]    3. 小车 USART1 不是 460800\r\n");
+        printf("[INIT]    3. 小车固件不支持或未开启 VelPos v2 (0x6C 0x81)\r\n");
     }
 
     printf("\r\n");
@@ -288,18 +303,56 @@ int main(void)
     delay_ms(1000);   /* 等小车启动稳定（启动到 ready 大约 500ms~1s）*/
     g_dfcom_unit_mode = DFCOM_UNIT_CM;  /* 本演示使用 cm / cm/s / deg / deg/s */
 
-    /* ─── 2. 启动诊断 + ODOM 启动请求 ─────────────── */
+    /* ===========================================================
+     * ★★ 单位切换 (一行就能改, 想用什么单位取消注释那一行就行) ★★
+     * -----------------------------------------------------------
+     *   Cmd_Move_* 函数入参的单位由 g_dfcom_unit_mode 决定:
+     *
+     *     DFCOM_UNIT_CM (★ 默认, 不改就是这个)
+     *         cm / cm/s / deg / deg/s
+     *         例: Cmd_Move_Linear(50, 0, 30, 1)   → 前进 50 cm, 30 cm/s
+     *
+     *     DFCOM_UNIT_MM (毫米, 精确定位 / 机械臂场景)
+     *         mm / mm/s / deg / deg/s
+     *         例: Cmd_Move_Linear(500, 0, 300, 1) → 前进 500 mm, 300 mm/s
+     *
+     *     DFCOM_UNIT_M (协议原生 SI)
+     *         m / m/s / rad / rad/s
+     *         例: Cmd_Move_Linear(0.5f, 0, 0.3f, 1) → 前进 0.5 m, 0.3 m/s
+     *
+     *   ⚠ 接收侧 g_odom / g_velpos 字段永远 SI (m / m/s / rad),
+     *      不受这个开关影响 (要看 cm/mm 自己 *100 / *1000)。
+     * -----------------------------------------------------------*/
+    // g_dfcom_unit_mode = DFCOM_UNIT_MM;   /* 毫米 + 度 */
+    // g_dfcom_unit_mode = DFCOM_UNIT_M;    /* 米 + 弧度 (SI) */
+    /* (不写就是默认 DFCOM_UNIT_CM, 厘米 + 度) */
+
+    /* ─── 2. 启动诊断 + VelPos 启动请求 ───────────── */
     /* ★ 如果已经确认接线 + 激活都 OK, 可以把下面这行注释掉, 启动更快 */
     /* Startup_Diagnose() 内部会发送:
-     *   Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
-     * 小车收到后会持续回传 ODOM, TIM2 会自动打印到 USART2。 */
+     *   Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+     * 小车收到后会持续回传 VelPos v2, TIM2 会自动打印到 USART2。 */
     Startup_Diagnose();
 
-    /* ─── 3. 主循环：小动作演示 + TIM2 自动打 ODOM ── */
+    /* ★★★ VelPos 自动打印位置说明 ★★★
+     * --------------------------------------------------------------
+     *  TIM2 在 System_Init() 里被初始化, 之后每 100ms (10Hz) 进入
+     *  TIM2_IRQHandler (DFCom_Print.c:72) 自动调用:
+     *
+     *    VelPos_Print()   ← 默认开 (简化版, 只 yaw+vel+pos)
+     *    // Odom_Print()  ← 默认注释 (全量进阶版, 含 roll/pitch/acc/gyro)
+     *
+     *  ⚠ 想换打印内容: 改 DFCom_Print.c:80~82 那块的注释 (取消 Odom_Print()
+     *                  的注释 / 注释掉 VelPos_Print 都行, 也可以两个同时开)
+     *  ⚠ 想关掉自动打印: 设 g_print_odom_enable = 0 (DFCom_Print.c:29)
+     *  ⚠ 想手动调用一次: 在你自己代码里直接调 VelPos_Print() 或 Odom_Print()
+     * --------------------------------------------------------------*/
+
+    /* ─── 3. 主循环：小动作演示 + TIM2 自动打 VelPos ─ */
     while (1)
     {
         /* ────────────────────────────────────────────
-         * 示例：小幅动作 + 实时 ODOM 回传
+         * 示例：小幅动作 + 实时 VelPos 回传
          *
          *   1) +X 前进 1cm
          *   2) -X 后退 1cm

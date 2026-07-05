@@ -525,12 +525,46 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
 }
 
 
+static u8 dfcom_freq_to_code(u8 freq_hz)
+{
+    if      (freq_hz == 10)  return 1;
+    else if (freq_hz == 50)  return 5;
+    else if (freq_hz == 100) return 10;
+    else if (freq_hz == 200) return 20;
+    else if (freq_hz == 250) return 25;
+    else if (freq_hz == 500) return 50;
+    else                     return 1;   /* 默认 10Hz */
+}
+
+static u8 dfcom_mode_to_visit_type(u8 mode)
+{
+    if      (mode == ODOM_MODE_CONTINUOUS) return 0x01;
+    else if (mode == ODOM_MODE_ONESHOT)    return 0x02;
+    else                                   return 0x02;   /* STOP → ONESHOT */
+}
+
+static void send_periodic_subscribe(u8 cmd, u8 mode, u8 freq_hz)
+{
+    u8 buf[15];
+    u8 cnt;
+
+    cnt = build_header(buf, 0x04, cmd);
+    buf[cnt++] = 2;
+    buf[cnt++] = dfcom_mode_to_visit_type(mode);
+    buf[cnt++] = dfcom_freq_to_code(freq_hz);
+    cnt = finalize_frame(buf, 2);
+    send_frame(buf, cnt);
+}
+
 /*============================================================================
- *  指令 6：ODOM 订阅 Cmd_Subscribe_Odom
+ *  指令 6：周期数据订阅
  *  ──────────────────────────────────────────────────────────────────────────
- *  Class/Cmd: A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
+ *  Odom   : A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
+ *  VelPos : A = 0x04 (DataRecivViitClass), B = 0x81 (VelPos_V)
  *
- *  含义：订阅 IMU_TIME 数据包（含 Yaw + 里程计 + IMU 原始）。
+ *  含义：
+ *    Cmd_Subscribe_Odom   订阅 Odom v4 全量包（Yaw + 里程计 + IMU 原始）
+ *    Cmd_Subscribe_VelPos 订阅 VelPos v2 简化包（Yaw + 位置 + 速度）
  *
  *  ★ 这条指令的协议层格式未变（订阅机制本身不动），但回传里的 N_PosX/Y
  *    现在的含义是 ROS 坐标系：+X 前进、+Y 左方 ★
@@ -555,31 +589,12 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
  *============================================================================*/
 void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz)
 {
-    /* Hz → 小车端枚举值 */
-    u8 fcode;
-    u8 vtype;
-    u8 buf[15];
-    u8 cnt;
+    send_periodic_subscribe(0x80, mode, freq_hz);
+}
 
-    if      (freq_hz == 10)  fcode = 1;
-    else if (freq_hz == 50)  fcode = 5;
-    else if (freq_hz == 100) fcode = 10;
-    else if (freq_hz == 200) fcode = 20;
-    else if (freq_hz == 250) fcode = 25;
-    else if (freq_hz == 500) fcode = 50;
-    else                     fcode = 1;   /* 默认 10Hz */
-
-    /* mode 标准化：小车不支持 STOP，用 ONESHOT 实现"发完一次自停" */
-    if      (mode == ODOM_MODE_CONTINUOUS) vtype = 0x01;
-    else if (mode == ODOM_MODE_ONESHOT)    vtype = 0x02;
-    else                                   vtype = 0x02;   /* STOP → ONESHOT */
-
-    cnt = build_header(buf, 0x04, 0x80);
-    buf[cnt++] = 2;
-    buf[cnt++] = vtype;
-    buf[cnt++] = fcode;
-    cnt = finalize_frame(buf, 2);
-    send_frame(buf, cnt);
+void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz)
+{
+    send_periodic_subscribe(0x81, mode, freq_hz);
 }
 
 
