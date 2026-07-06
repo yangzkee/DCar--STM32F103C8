@@ -161,10 +161,10 @@ TIM2 每 100ms 自动调用打印函数，通过 USART2 把数据输出到电脑
 当前 `main.c` 已设置为小幅动作演示：
 
 ```c
-Cmd_Move_Linear( 1, 0, 5, 0);  WaitMoveDone(CMD_LINEAR, 0);  // 前进 1 cm
-Cmd_Move_Linear(-1, 0, 5, 0);  WaitMoveDone(CMD_LINEAR, 0);  // 后退 1 cm
-Cmd_Move_Rot( 15, 30);         WaitMoveDone(CMD_ROT, 0);     // 左转 15 deg
-Cmd_Move_Rot(-15, 30);         WaitMoveDone(CMD_ROT, 0);     // 右转 15 deg
+Cmd_Move_Linear( 1, 0, 5, 0);  delay_ms(1500);  // 前进 1 cm, 等 1.5 秒
+Cmd_Move_Linear(-1, 0, 5, 0);  delay_ms(1500);  // 后退 1 cm, 等 1.5 秒
+Cmd_Move_Rot( 15, 30);         delay_ms(1500);  // 左转 15 deg, 等 1.5 秒
+Cmd_Move_Rot(-15, 30);         delay_ms(1500);  // 右转 15 deg, 等 1.5 秒
 ```
 
 默认单位模式：

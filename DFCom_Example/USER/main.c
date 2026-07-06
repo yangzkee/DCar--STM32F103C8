@@ -117,20 +117,12 @@
  *      Cmd_Move_Linear(0, 50, 30, 1); // +Y 左移 50 cm, 30 cm/s, profile=1(加减速)
  *      delay_ms(3000);                // 粗暴等 3 秒
  *
- *  🟡 进阶 (等小车真到位):
+ *  🟡 进阶 (固定动作时长):
  *      Cmd_Move_Linear(50, 0, 30, 1); // 第 4 参 profile: 0=匀速, 1=加减速 (推荐)
- *      WaitMoveDone(CMD_LINEAR, 0);    // ★ 第二参 0 = 永久等待 (推荐!)
- *                                      //   传 0 = 一直等到 MCU 真正回传完成
- *                                      //   不要设小的超时 (e.g. 5000ms), 会触发"雪崩吃单" bug
- *                                      //   ─── 第一参 cmd_code 必须跟刚发的函数对应:
- *                                      //       Cmd_Move_Linear         → CMD_LINEAR
- *                                      //       Cmd_Move_LinearWithYaw  → CMD_LINEAR_WITH_YAW
- *                                      //       Cmd_Move_Rot            → CMD_ROT
- *                                      //       Cmd_Move_Arc            → CMD_ARC
- *                                      //       Cmd_Move_Vel            → 不要用 WaitMoveDone
+ *      delay_ms(1500);                 // 本例程演示动作统一等待 1.5 秒
  *
- *  🔴 高手 (闭环, 读 g_odom 永远是 SI 米/弧度):
- *      while (g_odom.n_pos_x_m < 0.5f) {     // 0.5 m = 50 cm
+ *  🔴 高手 (闭环, 读 g_velpos 永远是 SI 米/弧度):
+ *      while (g_velpos.n_pos_x_m < 0.5f) {   // 0.5 m = 50 cm
  *          Cmd_Move_Vel(30, 0, 0);           // CM 模式: 30 cm/s
  *          delay_ms(50);
  *      }
@@ -363,37 +355,26 @@ int main(void)
          * 想改 SI 模式：System_Init 里打开 g_dfcom_unit_mode = DFCOM_UNIT_M
          *               然后把下面数值改成 0.01f / 0.05f / 0.2618f 等
          *
-         * ★ WaitMoveDone 第二参为啥都填 0 ?
-         *   0 = "永久等待", 不设超时, 一直等到 MCU 真正回完成回传
-         *   这是最安全的写法, 杜绝 "雪崩吃单" bug (一秒疯发 3~5 条, 每条没动)
-         *   绝对不要随便填一个小数字 (e.g. 5000), 万一比小车实际跑这段
-         *   所需的物理时间还短, 会触发雪崩。详见 DFCom_Rx.c::WaitMoveDone 注释。
-         *
-         * ★ WaitMoveDone 第一参 = CMD_xx, 必须跟刚发的指令对应!
-         *   Cmd_Move_Linear         → CMD_LINEAR           (0x64)
-         *   Cmd_Move_LinearWithYaw  → CMD_LINEAR_WITH_YAW  (0x65)
-         *   Cmd_Move_Rot            → CMD_ROT              (0x63)
-         *   Cmd_Move_Arc            → CMD_ARC              (0x66)
-         *   Cmd_Move_Vel            → ★ 别用 WaitMoveDone (没完成回传)
+         * 每个动作发出后固定等待 1.5 秒。
          * ────────────────────────────────────────────*/
         /* ★ Cmd_Move_Linear 第 4 参 = profile:
          *   0 = 匀速 (适合 1cm 这种短距离演示)
          *   1 = 加减速 (长距离更平滑)
          */
         printf("[DEMO] Forward 1 cm\r\n");
-        Cmd_Move_Linear( 1, 0, 5, 0);  WaitMoveDone(CMD_LINEAR, 0);
-        delay_ms(500);
+        Cmd_Move_Linear( 1, 0, 5, 0);
+        delay_ms(1500);
 
         printf("[DEMO] Backward 1 cm\r\n");
-        Cmd_Move_Linear(-1, 0, 5, 0);  WaitMoveDone(CMD_LINEAR, 0);
-        delay_ms(500);
+        Cmd_Move_Linear(-1, 0, 5, 0);
+        delay_ms(1500);
 
         printf("[DEMO] Turn left 15 deg\r\n");
-        Cmd_Move_Rot( 15, 30);         WaitMoveDone(CMD_ROT, 0);
-        delay_ms(500);
+        Cmd_Move_Rot( 15, 30);
+        delay_ms(1500);
 
         printf("[DEMO] Turn right 15 deg\r\n");
-        Cmd_Move_Rot(-15, 30);         WaitMoveDone(CMD_ROT, 0);
-        delay_ms(1000);
+        Cmd_Move_Rot(-15, 30);
+        delay_ms(1500);
     }
 }
