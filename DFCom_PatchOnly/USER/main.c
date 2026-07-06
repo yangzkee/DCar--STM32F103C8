@@ -190,10 +190,13 @@ static void System_Init(void)
  * 如果你已经确认接线正常 / 小车已激活, 这一步是可选的:
  *   在 main() 里把 Startup_Diagnose() 这一行注释掉即可, 直接进 while(1) 发指令。
  *
- * 等待时间已尽可能压缩:
- *   - 订阅后等 200ms (1~2 帧 10Hz 推回来) 确认链路
+ * 启动订阅会自动重试:
+ *   - STM32 上电很快, 可能早于小车底盘协议服务 ready
+ *   - 如果只发一次 Cmd_Subscribe_VelPos(), 小车没 ready 时会错过订阅
+ *   - 软复位能恢复, 正是因为软复位时小车已经 ready
+ *   - 所以这里会自动重发订阅, 直到 VelPos 帧数开始增长
+ *   - 注意: 不要高频狂发订阅; 太密可能反复重置底盘访问状态机
  *   - DcarState 查询超时 200ms (实际通常 5~30ms 就回来)
- *   - 总耗时 ~500ms, 比之前 (~3 秒) 短得多
  */
 static void Startup_Diagnose(void)
 {
@@ -201,6 +204,7 @@ static void Startup_Diagnose(void)
     u32 fc_odom_before,   fc_odom_after;
     u32 fc_velpos_before, fc_velpos_after;
     u32 diff_odom, diff_velpos;
+    u32 retry_count;
 
     printf("\r\n");
     printf("============================================\r\n");
@@ -219,10 +223,45 @@ static void Startup_Diagnose(void)
            (unsigned long)(((RCC->CR & RCC_CR_HSERDY) != 0) ? 1 : 0),
            (unsigned long)(((RCC->CR & RCC_CR_PLLRDY) != 0) ? 1 : 0));
 
-    /* 步骤 1：订阅 VelPos（持续 10Hz）—— 之后小车会自己 10Hz 推 VelPos v2 数据 */
-    printf("[INIT] Subscribe VelPos @ 10Hz...\r\n");
-    Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
-    delay_ms(150);   /* 等 ~1.5 帧, 让链路稳定 */
+    /* 步骤 1：订阅 VelPos（持续 10Hz）
+     *
+     * 关键说明:
+     *   很多上电问题不是接线错, 而是"STM32 比小车底盘 ready 得更早"。
+     *   上电时 STM32 只发一次订阅, 若小车 UART/VelPos 模块还没初始化完,
+     *   这条订阅会被错过; 之后手动软复位 STM32 又能好, 因为那时小车已 ready。
+     *
+     * 解决:
+     *   发一次订阅后最多等 2 秒; 仍无 VelPos 才重发下一次。
+     *   不要 100~500ms 高频狂发, 太密可能反复重置底盘访问状态机,
+     *   反而让第一帧永远来不及推出。
+     *   这样不依赖手动软复位, 也不依赖两边严格同时上电。
+     */
+    printf("[INIT] Subscribe VelPos @ 10Hz (auto retry until data)...\r\n");
+    retry_count = 0;
+    while (1) {
+        fc_velpos_before = g_velpos.frame_count;
+        Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+        t0 = g_local_tick_ms;
+        do {
+            delay_ms(20);
+            fc_velpos_after = g_velpos.frame_count;
+            if (fc_velpos_after != fc_velpos_before) {
+                break;
+            }
+        } while ((g_local_tick_ms - t0) < 2000);
+        fc_velpos_after = g_velpos.frame_count;
+
+        if (fc_velpos_after != fc_velpos_before) {
+            printf("[INIT] VelPos subscription OK after %lu attempt(s), frame_count=%lu\r\n",
+                   (unsigned long)(retry_count + 1),
+                   (unsigned long)fc_velpos_after);
+            break;
+        }
+
+        retry_count++;
+        printf("[INIT] VelPos not ready after 2s, retry subscribe #%lu...\r\n",
+               (unsigned long)(retry_count + 1));
+    }
 
     /* 步骤 2：查询小车状态（IMU 校准 / 控制参数）*/
     printf("[INIT] Query DcarState...\r\n");
@@ -255,7 +294,7 @@ static void Startup_Diagnose(void)
         printf("[INIT]    3. 小车有没有上电、是不是 460800 bps\r\n");
     }
 
-    /* 步骤 3：等 200ms 看 VelPos 流是否在动 */
+    /* 步骤 3：等 200ms 再确认 VelPos 流是否仍在动 */
     printf("[INIT] Waiting 200ms to check VelPos flow...\r\n");
     fc_odom_before   = g_odom.frame_count;
     fc_velpos_before = g_velpos.frame_count;

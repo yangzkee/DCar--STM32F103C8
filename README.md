@@ -146,6 +146,10 @@ Odom_PrintTimer_Init();     // TIM2 10Hz 自动打印
 Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
 ```
 
+启动阶段不是只发一次订阅，而是会自动重试：STM32 上电通常比小车底盘协议服务 ready 更早，如果小车还没准备好，第一次订阅可能被错过；这就是“上电没数据，软复位后有数据”的典型原因。例程现在会发送一次 `Cmd_Subscribe_VelPos()` 后等待最多 2 秒，仍无 VelPos 帧才重发下一次，避免高频重发把底盘访问状态机反复重置。
+
+注意：`Cmd_Subscribe_VelPos()` 这个 API 默认给用户读 VelPos，但底层订阅入口仍按当前底盘固件要求发送 `0x04/0x80`；VelPos 本身是回传帧 `0x6C/0x81`。不要把订阅命令误改成 `0x04/0x81`，否则部分底盘会一直没有数据。
+
 小车收到订阅请求后持续回传 VelPos v2 数据。STM32 使用 USART1 DMA + IDLE 中断接收，`DFCom_RxParse()` 自动解析数据，并写入：
 
 ```c

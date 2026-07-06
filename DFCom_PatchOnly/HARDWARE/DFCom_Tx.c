@@ -559,12 +559,18 @@ static void send_periodic_subscribe(u8 cmd, u8 mode, u8 freq_hz)
 /*============================================================================
  *  指令 6：周期数据订阅
  *  ──────────────────────────────────────────────────────────────────────────
- *  Odom   : A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
- *  VelPos : A = 0x04 (DataRecivViitClass), B = 0x81 (VelPos_V)
+ *  周期访问入口: A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
  *
  *  含义：
  *    Cmd_Subscribe_Odom   订阅 Odom v4 全量包（Yaw + 里程计 + IMU 原始）
  *    Cmd_Subscribe_VelPos 订阅 VelPos v2 简化包（Yaw + 位置 + 速度）
+ *
+ *  重要:
+ *    当前 DCar 底盘固件的"订阅命令入口"仍是 0x04/0x80。
+ *    VelPos v2 是回传帧 0x6C/0x81, 不是订阅命令 0x04/0x81。
+ *    如果发送 0x04/0x81, 部分底盘不会开启回传, 表现为一直 no data。
+ *    所以 Cmd_Subscribe_VelPos() 也通过 0x04/0x80 打开周期访问,
+ *    但应用层默认只读取和打印 g_velpos。
  *
  *  ★ 这条指令的协议层格式未变（订阅机制本身不动），但回传里的 N_PosX/Y
  *    现在的含义是 ROS 坐标系：+X 前进、+Y 左方 ★
@@ -594,7 +600,7 @@ void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz)
 
 void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz)
 {
-    send_periodic_subscribe(0x81, mode, freq_hz);
+    send_periodic_subscribe(0x80, mode, freq_hz);
 }
 
 
