@@ -165,6 +165,8 @@
 #define M_PI   3.14159265358979323846f
 #endif
 
+#define VELPOS_RETRY_INTERVAL_MS  2000
+
 /* ===========================================================================
  * 系统初始化
  * ===========================================================================*/
@@ -180,6 +182,50 @@ static void System_Init(void)
 }
 
 /* ===========================================================================
+ * VelPos 订阅维护 —— 不阻塞运动演示
+ * ---------------------------------------------------------------------------
+ * VelPos 回传只是显示/观测数据, 不能成为运动命令的前置条件。
+ *
+ * 上电时 STM32 可能比底盘协议服务更早 ready, 第一次订阅可能被错过。
+ * 所以这里做"旁路重试": 如果一段时间内 g_velpos.frame_count 没增长,
+ * 就补发一次 Cmd_Subscribe_VelPos()。
+ *
+ * 注意:
+ *   - 这个函数不会等待数据回来, 不会阻塞主循环。
+ *   - 运动命令照常发送; VelPos 成功后自然会开始打印有效数据。
+ *   - 重试间隔不要太短, 避免反复重置底盘访问状态机。
+ * ===========================================================================*/
+static void VelPos_Subscribe_Service(void)
+{
+    static u32 last_retry_ms = 0;
+    static u32 last_frame_count = 0;
+    u32 now = g_local_tick_ms;
+    u32 frame_count = g_velpos.frame_count;
+
+    if (frame_count != last_frame_count) {
+        last_frame_count = frame_count;
+        return;
+    }
+
+    if ((now - last_retry_ms) >= VELPOS_RETRY_INTERVAL_MS) {
+        Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+        last_retry_ms = now;
+        printf("[VELPOS] retry subscribe (no block, fr=%lu)\r\n",
+               (unsigned long)frame_count);
+    }
+}
+
+static void Delay_With_VelPos_Service(u32 ms)
+{
+    u32 start = g_local_tick_ms;
+
+    while ((g_local_tick_ms - start) < ms) {
+        VelPos_Subscribe_Service();
+        delay_ms(20);
+    }
+}
+
+/* ===========================================================================
  * 启动诊断 —— 帮学生快速发现接线/激活/校准问题
  * ===========================================================================*/
 /* ★ 启动诊断函数 — 可注释掉
@@ -190,12 +236,11 @@ static void System_Init(void)
  * 如果你已经确认接线正常 / 小车已激活, 这一步是可选的:
  *   在 main() 里把 Startup_Diagnose() 这一行注释掉即可, 直接进 while(1) 发指令。
  *
- * 启动订阅会自动重试:
+ * VelPos 订阅不会阻塞运动:
  *   - STM32 上电很快, 可能早于小车底盘协议服务 ready
  *   - 如果只发一次 Cmd_Subscribe_VelPos(), 小车没 ready 时会错过订阅
  *   - 软复位能恢复, 正是因为软复位时小车已经 ready
- *   - 所以这里会自动重发订阅, 直到 VelPos 帧数开始增长
- *   - 注意: 不要高频狂发订阅; 太密可能反复重置底盘访问状态机
+ *   - 本例程会在主循环旁路重试订阅, 但绝不因为没收到 VelPos 而阻塞运动
  *   - DcarState 查询超时 200ms (实际通常 5~30ms 就回来)
  */
 static void Startup_Diagnose(void)
@@ -204,7 +249,6 @@ static void Startup_Diagnose(void)
     u32 fc_odom_before,   fc_odom_after;
     u32 fc_velpos_before, fc_velpos_after;
     u32 diff_odom, diff_velpos;
-    u32 retry_count;
 
     printf("\r\n");
     printf("============================================\r\n");
@@ -223,45 +267,11 @@ static void Startup_Diagnose(void)
            (unsigned long)(((RCC->CR & RCC_CR_HSERDY) != 0) ? 1 : 0),
            (unsigned long)(((RCC->CR & RCC_CR_PLLRDY) != 0) ? 1 : 0));
 
-    /* 步骤 1：订阅 VelPos（持续 10Hz）
-     *
-     * 关键说明:
-     *   很多上电问题不是接线错, 而是"STM32 比小车底盘 ready 得更早"。
-     *   上电时 STM32 只发一次订阅, 若小车 UART/VelPos 模块还没初始化完,
-     *   这条订阅会被错过; 之后手动软复位 STM32 又能好, 因为那时小车已 ready。
-     *
-     * 解决:
-     *   发一次订阅后最多等 2 秒; 仍无 VelPos 才重发下一次。
-     *   不要 100~500ms 高频狂发, 太密可能反复重置底盘访问状态机,
-     *   反而让第一帧永远来不及推出。
-     *   这样不依赖手动软复位, 也不依赖两边严格同时上电。
-     */
-    printf("[INIT] Subscribe VelPos @ 10Hz (auto retry until data)...\r\n");
-    retry_count = 0;
-    while (1) {
-        fc_velpos_before = g_velpos.frame_count;
-        Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
-        t0 = g_local_tick_ms;
-        do {
-            delay_ms(20);
-            fc_velpos_after = g_velpos.frame_count;
-            if (fc_velpos_after != fc_velpos_before) {
-                break;
-            }
-        } while ((g_local_tick_ms - t0) < 2000);
-        fc_velpos_after = g_velpos.frame_count;
-
-        if (fc_velpos_after != fc_velpos_before) {
-            printf("[INIT] VelPos subscription OK after %lu attempt(s), frame_count=%lu\r\n",
-                   (unsigned long)(retry_count + 1),
-                   (unsigned long)fc_velpos_after);
-            break;
-        }
-
-        retry_count++;
-        printf("[INIT] VelPos not ready after 2s, retry subscribe #%lu...\r\n",
-               (unsigned long)(retry_count + 1));
-    }
+    /* 步骤 1：先发一次 VelPos 订阅。
+     * 如果此时底盘还没 ready, 后面的 VelPos_Subscribe_Service() 会旁路重试。
+     * 注意: 这里不会等待 VelPos 成功, 因为运动演示不能依赖遥测显示。 */
+    printf("[INIT] Subscribe VelPos @ 10Hz (non-blocking)...\r\n");
+    Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
 
     /* 步骤 2：查询小车状态（IMU 校准 / 控制参数）*/
     printf("[INIT] Query DcarState...\r\n");
@@ -309,15 +319,12 @@ static void Startup_Diagnose(void)
                (unsigned long)diff_velpos);
         printf("[INIT] ✓ All OK, sending commands...\r\n");
     } else {
-        printf("[INIT] ✗ NO VELPOS data!\r\n");
+        printf("[INIT] ✗ NO VELPOS data yet, demo will continue.\r\n");
         if (diff_odom > 0) {
             printf("[INIT]   Note: Odom v4 is flowing (+%lu), but VelPos v2 is not.\r\n",
                    (unsigned long)diff_odom);
         }
-        printf("[INIT]   小车没在推 VelPos -- 可能原因:\r\n");
-        printf("[INIT]    1. 接线问题 (同上)\r\n");
-        printf("[INIT]    2. 小车未激活 (上位机软件激活后再试)\r\n");
-        printf("[INIT]    3. 小车固件不支持或未开启 VelPos v2 (0x6C 0x81)\r\n");
+        printf("[INIT]   VelPos subscribe will retry in background.\r\n");
     }
 
     printf("\r\n");
@@ -402,18 +409,18 @@ int main(void)
          */
         printf("[DEMO] Forward 1 cm\r\n");
         Cmd_Move_Linear( 1, 0, 5, 0);
-        delay_ms(1500);
+        Delay_With_VelPos_Service(1500);
 
         printf("[DEMO] Backward 1 cm\r\n");
         Cmd_Move_Linear(-1, 0, 5, 0);
-        delay_ms(1500);
+        Delay_With_VelPos_Service(1500);
 
         printf("[DEMO] Turn left 15 deg\r\n");
         Cmd_Move_Rot( 15, 30);
-        delay_ms(1500);
+        Delay_With_VelPos_Service(1500);
 
         printf("[DEMO] Turn right 15 deg\r\n");
         Cmd_Move_Rot(-15, 30);
-        delay_ms(1500);
+        Delay_With_VelPos_Service(1500);
     }
 }
