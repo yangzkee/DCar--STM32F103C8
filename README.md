@@ -156,8 +156,3 @@ u8   GetMoveProgress      (u8 cmd_code);
 
 - `DCar-STM32F103C8-Keil.zip`：STM32 Keil 版完整工程
 - `DCar-STM32F103C8-Arduino.zip`：DFCom Arduino 版库与示例
-
-## 说明
-
-本仓库主线同步了你给的最新结构，保留了可直接上工程的 `DFCom_Example`、可移植的 `DFCom_PatchOnly`，并新增了 Arduino 资料。  
-如果你要对外给学员发放，建议默认发“Keil 版 + Arduino 版”两条下载入口，并把接线图和调试流程固定到课堂材料中。
