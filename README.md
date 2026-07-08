@@ -1,7 +1,6 @@
 # DCar 官方小车例程 - STM32F103C8 / DFCom v2
 
 适用于 STM32F103C8 的 DCar / DcarON 小车底盘通信例程，现已对齐 DFCom v2 协议。  
-这版 README 保留了旧版的“先会跑起来，再会开发”的讲解风格，帮助你快速从接线、编译、调试到二次开发。
 
 产品与教程页面：  
 https://differ-tech.pages.dev/portal/view/dcar-fast-motion-control
