@@ -66,8 +66,8 @@ void Odom_PrintTimer_Init(void)
  *   1. g_local_tick_ms++ (给 WaitMoveDone 等用)
  *   2. 每 100ms (= 10Hz) 调一次打印
  *
- * ★ 默认打印 VelPos v2 简化数据。
- * ★ 如果需要完整 Odom v4 数据, 可以改成 Odom_Print()。
+ * ★ 默认打印 VelPos (初学者版, 字段少看起来清爽)
+ * ★ 想看完整版 (含 roll/pitch/acc/gyro), 取消 Odom_Print() 那行的注释
  * ===========================================================================*/
 void TIM2_IRQHandler(void)
 {
@@ -79,13 +79,13 @@ void TIM2_IRQHandler(void)
         /* 10Hz 打印 */
         if (g_print_odom_enable && (g_local_tick_ms % 100) == 0) {
             VelPos_Print();   /* 简化版 (默认) */
-            // Odom_Print();  /* 全量版 (需要完整 Odom v4 时打开) */
+            // Odom_Print();  /* 全量进阶版 (默认注释; 取消注释即可看完整数据) */
         }
     }
 }
 
 /* ===========================================================================
- * VelPos_Print —— 打印 VelPos v2 简化版数据 (默认)
+ * VelPos_Print —— 打印 VelPos v2 简化版数据 (默认开, 初学者版)
  * ---------------------------------------------------------------------------
  * ★ 两个坐标系的区别 (这是新手最容易混淆的点!)
  *
@@ -111,7 +111,7 @@ void TIM2_IRQHandler(void)
  *                ↑ B 系速度: 车正以 0.2 m/s 向自己前方走
  *
  * ★ 调用方式
- *   订阅: send Cmd_Subscribe_VelPos(...) → 小车持续推 VelPos v2 帧
+ *   订阅: send Cmd_Subscribe_VelPos(...) → 点亮 VelPos v2 简化帧
  *   收到至少一帧才会打印 (frame_count > 0), 避免开机刷一堆 0。
  * ===========================================================================*/
 void VelPos_Print(void)
@@ -171,7 +171,7 @@ void VelPos_Print(void)
  * ★ 坐标系跟 VelPos 完全一致 (N 系 / B 系区别看 VelPos_Print 上面的注释)
  *
  * ★ 启用方式
- *   TIM2_IRQHandler 里把 `// Odom_Print();` 那行的注释去掉即可。
+ *   TIM2_IRQHandler 里把 `// Odom_Print();` 那行的注释去掉即可 (跟 VelPos_Print 并存)
  * ===========================================================================*/
 void Odom_Print(void)
 {

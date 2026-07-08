@@ -24,8 +24,9 @@ void USART1_IRQHandler(void);
 
 /* ★ USART1 RX buffer 容量
  * ──────────────────────────────────────────────────────────────────────
- * 小车一个 tick 同时回传两帧 (Odom v4 60B + VelPos v2 44B = 104B 背靠背)。
- * 旧的 100 字节装不下, 第二帧尾部被 DMA 截断 → CRC 失败 → 整帧丢。
+ * 同时订阅 Odom + VelPos 时, 小车一个 tick 可能回传两帧
+ * (Odom v4 60B + VelPos v2 44B = 104B 背靠背)。
+ * 旧的 100 字节装不下, 后续帧尾部被 DMA 截断 → CRC 失败 → 整帧丢。
  * 现在扩到 256 字节, 能容下 4~5 帧粘连 + 余量。
  * 配套: usart.c 里 DMA_BufferSize, DMA_SetCurrDataCounter, size 类型都改 u16。
  * 配套: DFCom_Rx.c DFCom_RxParse(u8*, u16 size) 参数类型也改 u16。

@@ -165,13 +165,13 @@ static void put_s32_le(u8 *buf, s32 v)
  *    speed:  最大速度
  *
  *  示例 (CM 模式, 默认):
- *    Cmd_Move_Linear(50, 0,   30)   →  前进 50 cm, 峰值 30 cm/s (~0.3 m/s)
- *    Cmd_Move_Linear(0,  50,  30)   →  左移 50 cm
- *    Cmd_Move_Linear(30, 30,  20)   →  斜向 (前左各 30 cm), 20 cm/s
+ *    Cmd_Move_Linear(50, 0,   30, 2)   →  前进 50 cm, 峰值 30 cm/s (~0.3 m/s)
+ *    Cmd_Move_Linear(0,  50,  30, 2)   →  左移 50 cm
+ *    Cmd_Move_Linear(30, 30,  20, 2)   →  斜向 (前左各 30 cm), 20 cm/s
  *
  *  示例 (M 模式):
- *    Cmd_Move_Linear(0.5, 0,   0.3) →  前进 0.5 m, 0.3 m/s
- *    Cmd_Move_Linear(0,   0.5, 0.3) →  左移 0.5 m
+ *    Cmd_Move_Linear(0.5, 0,   0.3, 2) →  前进 0.5 m, 0.3 m/s
+ *    Cmd_Move_Linear(0,   0.5, 0.3, 2) →  左移 0.5 m
  *
  *  完整帧布局（共 21 字节，注意协议层永远走 SI ×10000）：
  *
@@ -193,8 +193,7 @@ static void put_s32_le(u8 *buf, s32 v)
  *============================================================================*/
 void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
 {
-    /* ★ profile: 0=匀速 (起停硬, 短距精到位)
-     *            1=加减速 (★ 推荐, 梯形 ramp 平滑) */
+    /* ★ profile: 0=匀速, 1=梯形加减速, 2=高精度距离闭环 */
     u8 buf[32];
     u8 cnt;
     s32 ipx, ipy, ispd;
@@ -210,7 +209,7 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
     }
 
     if (speed_mps <= 0.0f) return;
-    if (profile > 1) profile = 1;   /* 兜底, 非 0/1 → 默认加减速 */
+    if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_LINEAR);
 
@@ -222,7 +221,7 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
     put_s32_le(&buf[cnt], ipx);  cnt += 4;
     put_s32_le(&buf[cnt], ipy);  cnt += 4;
     put_s32_le(&buf[cnt], ispd); cnt += 4;
-    buf[cnt++] = profile;                     /* ★ byte[12] = Profile (0/1) */
+    buf[cnt++] = profile;                     /* ★ byte[12] = Profile (0/1/2) */
 
     cnt = finalize_frame(buf, 13);
     clear_move_slot(CMD_LINEAR);
@@ -267,7 +266,7 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
  *============================================================================*/
 void Cmd_Move_LinearWithYaw(float px, float py, float dyaw_rad, float speed_mps, u8 profile)
 {
-    /* ★ profile: 0=匀速, 1=加减速 (★ 推荐) */
+    /* ★ profile: 0=匀速, 1=梯形加减速, 2=高精度距离闭环 */
     u8 buf[32];
     u8 cnt;
     s32 ipx, ipy, idyaw, ispd;
@@ -285,7 +284,7 @@ void Cmd_Move_LinearWithYaw(float px, float py, float dyaw_rad, float speed_mps,
     }
 
     if (speed_mps <= 0.0f) return;
-    if (profile > 1) profile = 1;
+    if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_LINEAR_WITH_YAW);
 
@@ -489,7 +488,7 @@ void Cmd_Move_Vel(float vx_mps, float vy_mps, float vz_rad_s)
  *============================================================================*/
 void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
 {
-    /* ★ profile: 0=匀速, 1=加减速 (★ 推荐) */
+    /* ★ profile: 0=匀速, 1=梯形加减速, 2=高精度距离闭环 */
     u8 buf[32];
     u8 cnt;
     s32 ir, idyaw, ispd;
@@ -505,7 +504,7 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
     }
 
     if (speed_mps <= 0.0f) return;
-    if (profile > 1) profile = 1;
+    if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_ARC);
 
@@ -525,52 +524,12 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
 }
 
 
-static u8 dfcom_freq_to_code(u8 freq_hz)
-{
-    if      (freq_hz == 10)  return 1;
-    else if (freq_hz == 50)  return 5;
-    else if (freq_hz == 100) return 10;
-    else if (freq_hz == 200) return 20;
-    else if (freq_hz == 250) return 25;
-    else if (freq_hz == 500) return 50;
-    else                     return 1;   /* 默认 10Hz */
-}
-
-static u8 dfcom_mode_to_visit_type(u8 mode)
-{
-    if      (mode == ODOM_MODE_CONTINUOUS) return 0x01;
-    else if (mode == ODOM_MODE_ONESHOT)    return 0x02;
-    else                                   return 0x02;   /* STOP → ONESHOT */
-}
-
-static void send_periodic_subscribe(u8 cmd, u8 mode, u8 freq_hz)
-{
-    u8 buf[15];
-    u8 cnt;
-
-    cnt = build_header(buf, 0x04, cmd);
-    buf[cnt++] = 2;
-    buf[cnt++] = dfcom_mode_to_visit_type(mode);
-    buf[cnt++] = dfcom_freq_to_code(freq_hz);
-    cnt = finalize_frame(buf, 2);
-    send_frame(buf, cnt);
-}
-
 /*============================================================================
- *  指令 6：周期数据订阅
+ *  指令 6：ODOM 订阅 Cmd_Subscribe_Odom
  *  ──────────────────────────────────────────────────────────────────────────
- *  周期访问入口: A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
+ *  Class/Cmd: A = 0x04 (DataRecivViitClass), B = 0x80 (Time_V)
  *
- *  含义：
- *    Cmd_Subscribe_Odom   订阅 Odom v4 全量包（Yaw + 里程计 + IMU 原始）
- *    Cmd_Subscribe_VelPos 订阅 VelPos v2 简化包（Yaw + 位置 + 速度）
- *
- *  重要:
- *    当前 DCar 底盘固件的"订阅命令入口"仍是 0x04/0x80。
- *    VelPos v2 是回传帧 0x6C/0x81, 不是订阅命令 0x04/0x81。
- *    如果发送 0x04/0x81, 部分底盘不会开启回传, 表现为一直 no data。
- *    所以 Cmd_Subscribe_VelPos() 也通过 0x04/0x80 打开周期访问,
- *    但应用层默认只读取和打印 g_velpos。
+ *  含义：订阅 IMU_TIME 数据包（含 Yaw + 里程计 + IMU 原始）。
  *
  *  ★ 这条指令的协议层格式未变（订阅机制本身不动），但回传里的 N_PosX/Y
  *    现在的含义是 ROS 坐标系：+X 前进、+Y 左方 ★
@@ -595,12 +554,59 @@ static void send_periodic_subscribe(u8 cmd, u8 mode, u8 freq_hz)
  *============================================================================*/
 void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz)
 {
-    send_periodic_subscribe(0x80, mode, freq_hz);
+    /* Hz → 小车端枚举值 */
+    u8 fcode;
+    u8 vtype;
+    u8 buf[15];
+    u8 cnt;
+
+    if      (freq_hz == 10)  fcode = 1;
+    else if (freq_hz == 50)  fcode = 5;
+    else if (freq_hz == 100) fcode = 10;
+    else if (freq_hz == 200) fcode = 20;
+    else if (freq_hz == 250) fcode = 25;
+    else if (freq_hz == 500) fcode = 50;
+    else                     fcode = 1;   /* 默认 10Hz */
+
+    /* mode 标准化：小车不支持 STOP，用 ONESHOT 实现"发完一次自停" */
+    if      (mode == ODOM_MODE_CONTINUOUS) vtype = 0x01;
+    else if (mode == ODOM_MODE_ONESHOT)    vtype = 0x02;
+    else                                   vtype = 0x02;   /* STOP → ONESHOT */
+
+    cnt = build_header(buf, 0x04, 0x80);
+    buf[cnt++] = 2;
+    buf[cnt++] = vtype;
+    buf[cnt++] = fcode;
+    cnt = finalize_frame(buf, 2);
+    send_frame(buf, cnt);
 }
 
 void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz)
 {
-    send_periodic_subscribe(0x80, mode, freq_hz);
+    /* Hz → 小车端枚举值 */
+    u8 fcode;
+    u8 vtype;
+    u8 buf[15];
+    u8 cnt;
+
+    if      (freq_hz == 10)  fcode = 1;
+    else if (freq_hz == 50)  fcode = 5;
+    else if (freq_hz == 100) fcode = 10;
+    else if (freq_hz == 200) fcode = 20;
+    else if (freq_hz == 250) fcode = 25;
+    else if (freq_hz == 500) fcode = 50;
+    else                     fcode = 1;
+
+    if      (mode == ODOM_MODE_CONTINUOUS) vtype = 0x01;
+    else if (mode == ODOM_MODE_ONESHOT)    vtype = 0x02;
+    else                                   vtype = 0x02;
+
+    cnt = build_header(buf, 0x04, 0x81);
+    buf[cnt++] = 2;
+    buf[cnt++] = vtype;
+    buf[cnt++] = fcode;
+    cnt = finalize_frame(buf, 2);
+    send_frame(buf, cnt);
 }
 
 

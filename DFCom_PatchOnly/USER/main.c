@@ -56,14 +56,14 @@
  *       ============================================
  *       [INIT] USART1 = 460800 (to DcarON)
  *       [INIT] USART2 = 115200 (this terminal)
- *       [INIT] Subscribe VelPos @ 10Hz...
+ *       [INIT] Subscribe ODOM @ 10Hz...
  *       [INIT] Query DcarState...
  *       [INIT] DcarState: imu_calibrated=1, finetune=1, par1=1.00 par2=1.00
- *       [INIT] VelPos data flowing ✓ (frame_count=15 in 200ms)
+ *       [INIT] ODOM data flowing ✓ (frame_count=15 in 1500ms)
  *       [INIT] ✓ All OK, sending commands...
  *
- *       [VELPOS] Yaw=  0.12 X(N,fwd)=  0.000 Y(N,left)=  0.000 ... fr=15
- *       [VELPOS] Yaw=  0.13 X(N,fwd)=  0.024 Y(N,left)=  0.000 ... fr=16
+ *       [ODOM] Yaw=  0.12 X(fwd)=  0.000 Y(left)=  0.000 ... fr=15
+ *       [ODOM] Yaw=  0.13 X(fwd)=  0.024 Y(left)=  0.000 ... fr=16
  *       ...
  *
  *
@@ -114,15 +114,23 @@
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *
  *  🟢 入门 (最简单):
- *      Cmd_Move_Linear(0, 50, 30, 1); // +Y 左移 50 cm, 30 cm/s, profile=1(加减速)
+ *      Cmd_Move_Linear(0, 50, 30, 2);    // +Y 左移 50 cm, 30 cm/s
  *      delay_ms(3000);                // 粗暴等 3 秒
  *
- *  🟡 进阶 (固定动作时长):
- *      Cmd_Move_Linear(50, 0, 30, 1); // 第 4 参 profile: 0=匀速, 1=加减速 (推荐)
- *      delay_ms(1500);                 // 本例程演示动作统一等待 1.5 秒
+ *  🟡 进阶 (等小车真到位):
+ *      Cmd_Move_Linear(50, 0, 30, 2);  // 第 4 参 profile: 2=高精度距离闭环
+ *      WaitMoveDone(CMD_LINEAR, 0);    // ★ 第二参 0 = 永久等待 (推荐!)
+ *                                      //   传 0 = 一直等到 MCU 真正回传完成
+ *                                      //   不要设小的超时 (e.g. 5000ms), 会触发"雪崩吃单" bug
+ *                                      //   ─── 第一参 cmd_code 必须跟刚发的函数对应:
+ *                                      //       Cmd_Move_Linear         → CMD_LINEAR
+ *                                      //       Cmd_Move_LinearWithYaw  → CMD_LINEAR_WITH_YAW
+ *                                      //       Cmd_Move_Rot            → CMD_ROT
+ *                                      //       Cmd_Move_Arc            → CMD_ARC
+ *                                      //       Cmd_Move_Vel            → 不要用 WaitMoveDone
  *
- *  🔴 高手 (闭环, 读 g_velpos 永远是 SI 米/弧度):
- *      while (g_velpos.n_pos_x_m < 0.5f) {   // 0.5 m = 50 cm
+ *  🔴 高手 (闭环, 读 g_odom 永远是 SI 米/弧度):
+ *      while (g_odom.n_pos_x_m < 0.5f) {     // 0.5 m = 50 cm
  *          Cmd_Move_Vel(30, 0, 0);           // CM 模式: 30 cm/s
  *          delay_ms(50);
  *      }
@@ -136,7 +144,7 @@
  *  ❌ 终端啥都不输出
  *     → USB-TTL 接错 PA2/PA3？波特率不是 115200？Keil 没勾 Use MicroLIB？
  *
- *  ❌ 看到 INIT 输出但 [INIT] ✗ NO VELPOS data
+ *  ❌ 看到 INIT 输出但 [INIT] ✗ NO TELEMETRY data
  *     → PA9/PA10 接小车的线没接？小车没上电？小车 USART1 不是 460800？
  *
  *  ❌ 看到 [INIT] ✗ DcarState query timeout
@@ -158,14 +166,11 @@
 #include "usart.h"
 #include "delay.h"
 #include "DFCom.h"
-#include "system_stm32f10x.h"
 
 /* M_PI 在 Keil C90 默认未定义，自己声明 */
 #ifndef M_PI
 #define M_PI   3.14159265358979323846f
 #endif
-
-#define VELPOS_RETRY_INTERVAL_MS  2000
 
 /* ===========================================================================
  * 系统初始化
@@ -176,58 +181,13 @@ static void System_Init(void)
     delay_init();
     uart_init(460800);          /* USART1 → DcarON */
     usart2_init(115200);        /* USART2 → printf 终端 */
-    Odom_PrintTimer_Init();     /* TIM2: 维护本地 ms tick + 10Hz 自动打印 VelPos */
-    /* ★ 单位模式默认 CM (厘米 + 度)
-     * 如需切换, 看 main() 里的 "★★ 单位切换 ★★" 那一段 */
+    Odom_PrintTimer_Init();     /* TIM2: 维护本地 ms tick + 10Hz 自动打 ODOM */
+
+    /* ★ 单位模式: 默认 DFCOM_UNIT_CM (厘米 + 度, 学生友好)
+     * 想用 SI 单位 (米 + rad)? 把下面这行注释打开: */
+    // g_dfcom_unit_mode = DFCOM_UNIT_M;
 }
 
-/* ===========================================================================
- * VelPos 订阅维护 —— 不阻塞运动演示
- * ---------------------------------------------------------------------------
- * VelPos 回传只是显示/观测数据, 不能成为运动命令的前置条件。
- *
- * 上电时 STM32 可能比底盘协议服务更早 ready, 第一次订阅可能被错过。
- * 所以这里做"旁路重试": 如果一段时间内 g_velpos.frame_count 没增长,
- * 就补发一次 Cmd_Subscribe_VelPos()。
- *
- * 注意:
- *   - 这个函数不会等待数据回来, 不会阻塞主循环。
- *   - 运动命令照常发送; VelPos 成功后自然会开始打印有效数据。
- *   - 重试间隔不要太短, 避免反复重置底盘访问状态机。
- * ===========================================================================*/
-static void VelPos_Subscribe_Service(void)
-{
-    static u32 last_retry_ms = 0;
-    static u32 last_frame_count = 0;
-    u32 now = g_local_tick_ms;
-    u32 frame_count = g_velpos.frame_count;
-
-    if (frame_count != last_frame_count) {
-        last_frame_count = frame_count;
-        return;
-    }
-
-    if ((now - last_retry_ms) >= VELPOS_RETRY_INTERVAL_MS) {
-        Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
-        last_retry_ms = now;
-        printf("[VELPOS] retry subscribe (no block, fr=%lu)\r\n",
-               (unsigned long)frame_count);
-    }
-}
-
-static void Delay_With_VelPos_Service(u32 ms)
-{
-    u32 start = g_local_tick_ms;
-
-    while ((g_local_tick_ms - start) < ms) {
-        VelPos_Subscribe_Service();
-        delay_ms(20);
-    }
-}
-
-/* ===========================================================================
- * 启动诊断 —— 帮学生快速发现接线/激活/校准问题
- * ===========================================================================*/
 /* ★ 启动诊断函数 — 可注释掉
  * ──────────────────────────────────────────────────────────────────────
  * 这是给学生用的"自检流程", 帮你快速发现接线/激活/通信问题。
@@ -236,19 +196,15 @@ static void Delay_With_VelPos_Service(u32 ms)
  * 如果你已经确认接线正常 / 小车已激活, 这一步是可选的:
  *   在 main() 里把 Startup_Diagnose() 这一行注释掉即可, 直接进 while(1) 发指令。
  *
- * VelPos 订阅不会阻塞运动:
- *   - STM32 上电很快, 可能早于小车底盘协议服务 ready
- *   - 如果只发一次 Cmd_Subscribe_VelPos(), 小车没 ready 时会错过订阅
- *   - 软复位能恢复, 正是因为软复位时小车已经 ready
- *   - 本例程会在主循环旁路重试订阅, 但绝不因为没收到 VelPos 而阻塞运动
- *   - DcarState 查询超时 200ms (实际通常 5~30ms 就回来)
- */
+ * 等待时间已尽可能压缩, 总耗时 ~500ms (原来 ~3 秒)。
+ *
+ * ===========================================================================*/
 static void Startup_Diagnose(void)
 {
     u32 t0;
-    u32 fc_odom_before,   fc_odom_after;
+    u32 fc_odom_before, fc_odom_after;
     u32 fc_velpos_before, fc_velpos_after;
-    u32 diff_odom, diff_velpos;
+    u32 diff_odom, diff_velpos, diff_total;
 
     printf("\r\n");
     printf("============================================\r\n");
@@ -258,20 +214,12 @@ static void Startup_Diagnose(void)
     printf("============================================\r\n");
     printf("[INIT] USART1 = 460800 (to DcarON)\r\n");
     printf("[INIT] USART2 = 115200 (this terminal)\r\n");
-    printf("[CLK] SystemCoreClock=%lu\r\n", (unsigned long)SystemCoreClock);
-    printf("[CLK] RCC->CFGR=0x%08lX RCC->CR=0x%08lX\r\n",
-           (unsigned long)RCC->CFGR,
-           (unsigned long)RCC->CR);
-    printf("[CLK] SWS=0x%02lX HSERDY=%lu PLLRDY=%lu\r\n",
-           (unsigned long)((RCC->CFGR & RCC_CFGR_SWS) >> 2),
-           (unsigned long)(((RCC->CR & RCC_CR_HSERDY) != 0) ? 1 : 0),
-           (unsigned long)(((RCC->CR & RCC_CR_PLLRDY) != 0) ? 1 : 0));
 
-    /* 步骤 1：先发一次 VelPos 订阅。
-     * 如果此时底盘还没 ready, 后面的 VelPos_Subscribe_Service() 会旁路重试。
-     * 注意: 这里不会等待 VelPos 成功, 因为运动演示不能依赖遥测显示。 */
-    printf("[INIT] Subscribe VelPos @ 10Hz (non-blocking)...\r\n");
+    /* 步骤 1：独立订阅 Odom + VelPos（持续 10Hz） */
+    printf("[INIT] Subscribe ODOM + VelPos @ 10Hz...\r\n");
+    Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
     Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+    delay_ms(150);   /* 等 ~1.5 帧, 让链路稳定 */
 
     /* 步骤 2：查询小车状态（IMU 校准 / 控制参数）*/
     printf("[INIT] Query DcarState...\r\n");
@@ -304,27 +252,27 @@ static void Startup_Diagnose(void)
         printf("[INIT]    3. 小车有没有上电、是不是 460800 bps\r\n");
     }
 
-    /* 步骤 3：等 200ms 再确认 VelPos 流是否仍在动 */
-    printf("[INIT] Waiting 200ms to check VelPos flow...\r\n");
-    fc_odom_before   = g_odom.frame_count;
+    /* 步骤 3：等 200ms 看 telemetry 流是否在动 */
+    printf("[INIT] Waiting 200ms to check telemetry flow...\r\n");
+    fc_odom_before = g_odom.frame_count;
     fc_velpos_before = g_velpos.frame_count;
-    delay_ms(200);   /* 10Hz × 0.2s ≈ 2 帧, 足够确认链路 (原来 1500ms 太久了) */
-    fc_odom_after   = g_odom.frame_count;
+    delay_ms(200);
+    fc_odom_after = g_odom.frame_count;
     fc_velpos_after = g_velpos.frame_count;
-    diff_odom   = fc_odom_after   - fc_odom_before;
+    diff_odom = fc_odom_after - fc_odom_before;
     diff_velpos = fc_velpos_after - fc_velpos_before;
+    diff_total = diff_odom + diff_velpos;
 
-    if (diff_velpos > 0) {
-        printf("[INIT] VelPos data flowing ✓ (frame_count +%lu in 200ms)\r\n",
-               (unsigned long)diff_velpos);
+    if (diff_total > 0) {
+        printf("[INIT] Telemetry flowing ✓ (Odom=%lu + VelPos=%lu in 200ms)\r\n",
+               (unsigned long)diff_odom, (unsigned long)diff_velpos);
         printf("[INIT] ✓ All OK, sending commands...\r\n");
     } else {
-        printf("[INIT] ✗ NO VELPOS data yet, demo will continue.\r\n");
-        if (diff_odom > 0) {
-            printf("[INIT]   Note: Odom v4 is flowing (+%lu), but VelPos v2 is not.\r\n",
-                   (unsigned long)diff_odom);
-        }
-        printf("[INIT]   VelPos subscribe will retry in background.\r\n");
+        printf("[INIT] ✗ NO TELEMETRY data!\r\n");
+        printf("[INIT]   小车没在推数据 -- 可能原因:\r\n");
+        printf("[INIT]    1. 接线问题 (同上)\r\n");
+        printf("[INIT]    2. 小车未激活 (上位机软件激活后再试)\r\n");
+        printf("[INIT]    3. 小车 USART1 不是 460800\r\n");
     }
 
     printf("\r\n");
@@ -339,88 +287,59 @@ int main(void)
     /* ─── 1. 初始化（串口、定时器）─────────────────── */
     System_Init();
     delay_ms(1000);   /* 等小车启动稳定（启动到 ready 大约 500ms~1s）*/
-    g_dfcom_unit_mode = DFCOM_UNIT_CM;  /* 本演示使用 cm / cm/s / deg / deg/s */
 
-    /* ===========================================================
-     * ★★ 单位切换 (一行就能改, 想用什么单位取消注释那一行就行) ★★
-     * -----------------------------------------------------------
-     *   Cmd_Move_* 函数入参的单位由 g_dfcom_unit_mode 决定:
-     *
-     *     DFCOM_UNIT_CM (★ 默认, 不改就是这个)
-     *         cm / cm/s / deg / deg/s
-     *         例: Cmd_Move_Linear(50, 0, 30, 1)   → 前进 50 cm, 30 cm/s
-     *
-     *     DFCOM_UNIT_MM (毫米, 精确定位 / 机械臂场景)
-     *         mm / mm/s / deg / deg/s
-     *         例: Cmd_Move_Linear(500, 0, 300, 1) → 前进 500 mm, 300 mm/s
-     *
-     *     DFCOM_UNIT_M (协议原生 SI)
-     *         m / m/s / rad / rad/s
-     *         例: Cmd_Move_Linear(0.5f, 0, 0.3f, 1) → 前进 0.5 m, 0.3 m/s
-     *
-     *   ⚠ 接收侧 g_odom / g_velpos 字段永远 SI (m / m/s / rad),
-     *      不受这个开关影响 (要看 cm/mm 自己 *100 / *1000)。
-     * -----------------------------------------------------------*/
-    // g_dfcom_unit_mode = DFCOM_UNIT_MM;   /* 毫米 + 度 */
-    // g_dfcom_unit_mode = DFCOM_UNIT_M;    /* 米 + 弧度 (SI) */
-    /* (不写就是默认 DFCOM_UNIT_CM, 厘米 + 度) */
-
-    /* ─── 2. 启动诊断 + VelPos 启动请求 ───────────── */
+    /* ─── 2. 启动诊断 —— 打印链路 / 激活状态 ──────── */
     /* ★ 如果已经确认接线 + 激活都 OK, 可以把下面这行注释掉, 启动更快 */
-    /* Startup_Diagnose() 内部会发送:
-     *   Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
-     * 小车收到后会持续回传 VelPos v2, TIM2 会自动打印到 USART2。 */
     Startup_Diagnose();
 
-    /* ★★★ VelPos 自动打印位置说明 ★★★
-     * --------------------------------------------------------------
-     *  TIM2 在 System_Init() 里被初始化, 之后每 100ms (10Hz) 进入
-     *  TIM2_IRQHandler (DFCom_Print.c:72) 自动调用:
-     *
-     *    VelPos_Print()   ← 默认开 (简化版, 只 yaw+vel+pos)
-     *    // Odom_Print()  ← 默认注释 (全量进阶版, 含 roll/pitch/acc/gyro)
-     *
-     *  ⚠ 想换打印内容: 改 DFCom_Print.c:80~82 那块的注释 (取消 Odom_Print()
-     *                  的注释 / 注释掉 VelPos_Print 都行, 也可以两个同时开)
-     *  ⚠ 想关掉自动打印: 设 g_print_odom_enable = 0 (DFCom_Print.c:29)
-     *  ⚠ 想手动调用一次: 在你自己代码里直接调 VelPos_Print() 或 Odom_Print()
-     * --------------------------------------------------------------*/
-
-    /* ─── 3. 主循环：小动作演示 + TIM2 自动打 VelPos ─ */
+    /* ─── 3. 主循环：发指令 + TIM2 自动打 ODOM ────── */
     while (1)
     {
         /* ────────────────────────────────────────────
-         * 示例：小幅动作 + 实时 VelPos 回传
+         * 示例：走一个 50cm × 50cm 的方块（ROS 坐标系 +X 前 +Y 左）
          *
-         *   1) +X 前进 1cm
-         *   2) -X 后退 1cm
-         *   3) +Yaw 左转 15°
-         *   4) -Yaw 右转 15°
+         *   起点 (0, 0)
+         *      ↑ 步骤 1: +X 前进 50cm  → 到 (50, 0)
+         *      ← 步骤 2: +Y 左移 50cm  → 到 (50, 50)
+         *      ↓ 步骤 3: -X 后退 50cm  → 到 (0, 50)
+         *      → 步骤 4: -Y 右移 50cm  → 回到 (0, 0)
          *
-         * 默认 CM 模式：直线速度 5 cm/s, 旋转速度 30 deg/s
+         * 入门玩法：注释掉 WaitMoveDone，加 delay_ms(3000)
+         * 进阶玩法：用 WaitMoveDone 等小车真到位（当前就是）
+         *
+         * 默认 CM 模式：速度统一 30 cm/s (约 0.3 m/s)
          * 想改 SI 模式：System_Init 里打开 g_dfcom_unit_mode = DFCOM_UNIT_M
-         *               然后把下面数值改成 0.01f / 0.05f / 0.2618f 等
+         *               然后把下面数值改成 0.5f / 0.3f 等
          *
-         * 每个动作发出后固定等待 1.5 秒。
+         * ★ WaitMoveDone 第二参为啥都填 0 ?
+         *   0 = "永久等待", 不设超时, 一直等到 MCU 真正回完成回传
+         *   这是最安全的写法, 杜绝 "雪崩吃单" bug (一秒疯发 3~5 条, 每条没动)
+         *   绝对不要随便填一个小数字 (e.g. 5000), 万一比小车实际跑这段
+         *   所需的物理时间还短, 会触发雪崩。详见 DFCom_Rx.c::WaitMoveDone 注释。
+         *
+         * ★ WaitMoveDone 第一参 = CMD_xx, 必须跟刚发的指令对应!
+         *   Cmd_Move_Linear         → CMD_LINEAR           (0x64)
+         *   Cmd_Move_LinearWithYaw  → CMD_LINEAR_WITH_YAW  (0x65)
+         *   Cmd_Move_Rot            → CMD_ROT              (0x63)
+         *   Cmd_Move_Arc            → CMD_ARC              (0x66)
+         *   Cmd_Move_Vel            → ★ 别用 WaitMoveDone (没完成回传)
          * ────────────────────────────────────────────*/
         /* ★ Cmd_Move_Linear 第 4 参 = profile:
-         *   0 = 匀速 (适合 1cm 这种短距离演示)
-         *   1 = 加减速 (长距离更平滑)
+         *   0 = 匀速 (起停硬, 短距精确到位)
+         *   1 = 加减速 (★ 推荐, 平滑梯形 ramp)
          */
-        printf("[DEMO] Forward 1 cm\r\n");
-        Cmd_Move_Linear( 1, 0, 5, 0);
-        Delay_With_VelPos_Service(1500);
+        Cmd_Move_Linear( 50,   0,  30, 2);  WaitMoveDone(CMD_LINEAR, 0);  /* +X 前进 50cm, Profile 2 */
+        Cmd_Move_Linear(  0,  50,  30, 2);  WaitMoveDone(CMD_LINEAR, 0);  /* +Y 左移 50cm */
+        Cmd_Move_Linear(-50,   0,  30, 2);  WaitMoveDone(CMD_LINEAR, 0);  /* -X 后退 50cm */
+        Cmd_Move_Linear(  0, -50,  30, 2);  WaitMoveDone(CMD_LINEAR, 0);  /* -Y 右移 50cm */
 
-        printf("[DEMO] Backward 1 cm\r\n");
-        Cmd_Move_Linear(-1, 0, 5, 0);
-        Delay_With_VelPos_Service(1500);
+        /* 想画整圆？取消注释下面这行（半径 30cm, 圆心角 360°, 20 cm/s, 加减速）：*/
+        // Cmd_Move_Arc(30, 360, 20, 1);  WaitMoveDone(CMD_ARC, 0);
 
-        printf("[DEMO] Turn left 15 deg\r\n");
-        Cmd_Move_Rot( 15, 30);
-        Delay_With_VelPos_Service(1500);
+        /* 想原地左转 90°（CCW 逆时针，60 deg/s）？*/
+        // Cmd_Move_Rot( 90, 60);  WaitMoveDone(CMD_ROT, 0);
 
-        printf("[DEMO] Turn right 15 deg\r\n");
-        Cmd_Move_Rot(-15, 30);
-        Delay_With_VelPos_Service(1500);
+        /* 想原地右转 90°（CW 顺时针，dyaw 取负）？*/
+        // Cmd_Move_Rot(-90, 60);  WaitMoveDone(CMD_ROT, 0);
     }
 }

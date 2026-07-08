@@ -25,8 +25,8 @@
  *
  *   A      B        含义                                  小车端发起位置
  *   ────   ──────   ──────────────────────────────────    ─────────────────────────
- *   0x6C   0x80     IMU_TIME 数据帧 (36B payload)         DF_CoreState.c::DF_IMU_TIME
- *                   含 Acc/Gyro/Yaw(rad s32)/B_Vel/N_Pos/Time
+ *   0x6C   0x80     Odom v4 全量帧 (51B payload)          DF_CoreState.c::DF_Send_odom
+ *   0x6C   0x81     VelPos v2 简化帧 (35B payload)        DF_CoreState.c::DF_Send_vel_pose
  *   0x6F   *        运动完成回传 (ProgressBack, 2B)       DF_CoreFlag.c::DF_Flag_Back
  *                   payload = [Process(0xFF=完成), Notice]
  *   0x8C   0x40     激活/校准状态 (12B payload)           DF_CoreDate.c::DF_DcarParmState
@@ -419,7 +419,7 @@ void DFCom_RxParse(u8 *data, u16 size)
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 用法示例 ★
  *
- *    Cmd_Move_Linear(0.5f, 0, 0.3f);    // SI 模式: 前进 0.5m, 速度 0.3m/s
+ *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);    // SI 模式: 前进 0.5m, 速度 0.3m/s
  *    WaitMoveDone(CMD_LINEAR, 0);       // 永久等, 推荐
  *
  *    Cmd_Move_Arc(0.3f, 1.5708f, 0.2f); // 半径 0.3m, +90°, 0.2m/s
@@ -429,7 +429,7 @@ void DFCom_RxParse(u8 *data, u16 size)
  *    WaitMoveDone(CMD_ROT, 0);
  *
  *  示例 (带超时, 必须保守):
- *    Cmd_Move_Linear(0.5f, 0, 0.3f);
+ *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);
  *    if (WaitMoveDone(CMD_LINEAR, 15000) == 0) {     // 15s 兜底
  *        printf("timeout, sending stop\r\n");
  *        Cmd_Move_Velocity(0, 0, 0);                  // 主动停车
@@ -476,7 +476,25 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
                 return 0;
             }
         }
+        /*===== 低功耗优化建议 (高级, 当前未启用) ======================================
+         * 下面这行 delay_ms(10) 是 SysTick 忙等待, 等待期间 CPU 一直在自旋,
+         * 浪费功耗 + 占住 CPU 不能干别的事。
+         *
+         * 如果你想让 CPU 在等待期间睡眠 (省电 + 让出 CPU 给其他任务), 把
+         *      delay_ms(10);
+         * 替换为下面这一行:
+         *      __WFI();    // Wait For Interrupt, ARM Cortex-M 标准指令
+         *
+         * 原理: __WFI() 让 CPU 立刻进入睡眠, 任何中断 (SysTick 1ms / USART RX)
+         *       都会自动唤醒。 这样 CPU 占用从 ~100% 降到 ~0.1%, 行为完全一致。
+         *
+         * 注意: 进入 __WFI 前必须确保 SysTick + USART RX 中断已启用 (默认就是这样,
+         *       不用改); 不要在 __disable_irq() 之后调 __WFI, 否则永远醒不来。
+         *
+         * 我们当前保留 delay_ms(10) 是因为这版例程优先考虑简单易懂, 用户可按需切换。
+         *===========================================================================*/
         delay_ms(10);
+        //__WFI(); 
     }
 }
 

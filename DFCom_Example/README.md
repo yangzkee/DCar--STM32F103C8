@@ -9,7 +9,7 @@
 
 一份**面向大学生教学**的精简版 DcarON 客户端例程：
 
-- 🟢 **入门**：调一行 `Cmd_Move_Linear(0, 50, 30, 1)` 就能让车 +Y 左移 50 cm（30 cm/s，梯形加减速）
+- 🟢 **入门**：调一行 `Cmd_Move_Linear(0, 50, 30, 2)` 就能让车 +Y 左移 50 cm（30 cm/s）
 - 🟡 **进阶**：调完后跟一行 `WaitMoveDone(...)` 等小车到位再下一条
 - 🔴 **高手**：直接读 `g_odom.yaw_rad` / `g_odom.n_pos_x_m` 写自己的闭环算法（注意永远是 SI）
 - 📺 **数据可视化**：插上 USB-TTL 接到 USART2，PC 终端自动看到 10Hz ODOM 实时数据
@@ -50,7 +50,7 @@ DFCom_Example/
 5. PC 打开串口工具（115200 8N1）接 USB-TTL 那个 COM 口
 6. 上电，终端就能看到：
    ```
-   [INIT] Subscribe VelPos @ 10Hz...
+   [INIT] Subscribe ODOM @ 10Hz...
    [INIT] ODOM data flowing ✓ (got 15 frames in 1.5s)
    [ODOM] Yaw=  0.12 X(fwd)=  0.000 Y(left)=  0.000 Vx(fwd)=  0.00 Vy(left)=  0.00 Gz=  0.01 fr=1
    [ODOM] Yaw=  0.15 X(fwd)=  0.024 Y(left)=  0.000 Vx(fwd)=  0.25 Vy(left)=  0.00 Gz=  0.02 fr=2
@@ -103,7 +103,7 @@ left     │
 ```c
 // main.c System_Init() 最后:
 g_dfcom_unit_mode = DFCOM_UNIT_CM;   // ★ 默认, 不写也行
-Cmd_Move_Linear(0, 50, 30, 1);       // +Y 左移 50 cm, 30 cm/s, profile=1 平滑加减速
+Cmd_Move_Linear(0, 50, 30, 2);          // +Y 左移 50 cm, 30 cm/s
 Cmd_Move_Rot(90, 60);                // 左转 90°, 最大 60 deg/s
 ```
 
@@ -111,7 +111,7 @@ Cmd_Move_Rot(90, 60);                // 左转 90°, 最大 60 deg/s
 
 ```c
 g_dfcom_unit_mode = DFCOM_UNIT_M;
-Cmd_Move_Linear(0, 0.5f, 0.3f, 1);   // +Y 左移 0.5 m, 0.3 m/s, profile=1 平滑加减速
+Cmd_Move_Linear(0, 0.5f, 0.3f, 2);      // +Y 左移 0.5 m, 0.3 m/s
 Cmd_Move_Rot(1.5708f, 1.0f);         // 左转 π/2 rad, 最大 1.0 rad/s
 ```
 
@@ -130,10 +130,10 @@ Cmd_Move_Rot(1.5708f, 1.0f);         // 左转 π/2 rad, 最大 1.0 rad/s
 ### 控制指令（在 `main.c` 里调用）
 
 ```c
-/* 直线位移；profile: 0=匀速, 1=梯形加减速（推荐） */
+/* 直线位移（默认梯形加减速） */
 void Cmd_Move_Linear        (float px,    float py,    float speed_mps, u8 profile);
 
-/* 平移 + yaw 同时（"无头"模式）；profile: 0=匀速, 1=梯形加减速（推荐） */
+/* 平移 + yaw 同时（"无头"模式） */
 void Cmd_Move_LinearWithYaw (float px,    float py,    float dyaw_rad, float speed_mps, u8 profile);
 
 /* 原地旋转（相对增量，CCW+） */
@@ -142,20 +142,21 @@ void Cmd_Move_Rot           (float dyaw_rad, float omega_max_rad_s);
 /* 持续速度（遥控用，无完成回传，要主动停） */
 void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);
 
-/* 圆弧；profile: 0=匀速, 1=梯形加减速（推荐） */
+/* 圆弧 */
 void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);
 
-/* 订阅 VelPos / Odom 数据 */
-void Cmd_Subscribe_VelPos   (u8 mode, u8 freq_hz);  // 默认
-void Cmd_Subscribe_Odom     (u8 mode, u8 freq_hz);  // 全量 Odom
+/* 订阅 Odom / VelPos 数据 */
+void Cmd_Subscribe_Odom     (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_VelPos   (u8 mode, u8 freq_hz);
 ```
 
 ### ODOM 订阅模式
 
 ```c
-Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, 10);  // ★持续模式，10Hz（默认）
-Cmd_Subscribe_VelPos(ODOM_MODE_ONESHOT,    1);   // 拍一帧快照
-Cmd_Subscribe_VelPos(ODOM_MODE_STOP,       0);   // 停止推送
+Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, 10);  // ★持续模式，10Hz（最常用）
+Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, 10);// 简化帧，按需订阅
+Cmd_Subscribe_Odom(ODOM_MODE_ONESHOT,    1);   // 拍一帧快照
+Cmd_Subscribe_Odom(ODOM_MODE_STOP,       0);   // 停止推送
 ```
 
 **重要**：持续模式下小车收到一次订阅就会自己一直推送，**客户端不需要反复发请求**！
@@ -182,22 +183,16 @@ g_odom.frame_count   // 总帧数（用来判数据流是不是活的）
 ### 等运动完成（可选）
 
 ```c
-// ★ 第二参 = 0 表示 "永久等待 (不超时)", 这是最安全的写法 ★
-WaitMoveDone(CMD_LINEAR, 0)            // 等直线位移指令完成 (永久等)
-WaitMoveDone(CMD_LINEAR_WITH_YAW, 0)   // 等无头位移
-WaitMoveDone(CMD_ARC, 0)               // 等圆弧
-WaitMoveDone(CMD_ROT, 0)               // 等旋转
+WaitMoveDone(CMD_LINEAR, 5000)            // 等直线位移指令完成，超时 5 秒
+WaitMoveDone(CMD_LINEAR_WITH_YAW, 5000)   // 等无头位移
+WaitMoveDone(CMD_ARC, 10000)              // 等圆弧
+WaitMoveDone(CMD_ROT, 3000)               // 等旋转
 
 // CMD_VEL 持续速度没有完成回传，不能用 WaitMoveDone
 
 // 不阻塞的进度查询（适合做 UI 进度条）
 u8 prog = GetMoveProgress(CMD_LINEAR);    // 0~254 进度, 255=完成
 ```
-
-⚠️ **不要轻易给第二参填一个小数字 (e.g. 5000ms)**，万一比小车实际跑这段
-所需的物理时间还短，会触发"雪崩吃单" bug：客户端超时返回 → 立刻发下一条
-→ MCU 端被打断 → 立刻回 0xFF/0x64 → 客户端被骗"完成" → 又发下一条 →
-**一秒疯发 3~5 条，每条几乎没动**。详见 `DFCom_Rx.c::WaitMoveDone` 注释。
 
 ## 三个等级的用法示例（默认 CM 模式）
 
@@ -207,9 +202,9 @@ u8 prog = GetMoveProgress(CMD_LINEAR);    // 0~254 进度, 255=完成
 
 ```c
 while (1) {
-    Cmd_Move_Linear(50, 0, 30, 1);    // +X 前进 50 cm, 30 cm/s, profile=1
+    Cmd_Move_Linear(50, 0, 30, 2);       // +X 前进 50 cm, 30 cm/s
     delay_ms(3000);                   // 粗暴等 3 秒
-    Cmd_Move_Linear(0, 50, 30, 1);    // +Y 左移 50 cm
+    Cmd_Move_Linear(0, 50, 30, 2);       // +Y 左移 50 cm
     delay_ms(3000);
 }
 ```
@@ -218,10 +213,10 @@ while (1) {
 
 ```c
 while (1) {
-    Cmd_Move_Linear(50, 0, 30, 1);    // +X 前进 50 cm, 30 cm/s
-    WaitMoveDone(CMD_LINEAR, 0);      // 等小车真到位 (0 = 永久等待, 推荐)
-    Cmd_Move_Linear(0, 50, 30, 1);    // +Y 左移 50 cm
-    WaitMoveDone(CMD_LINEAR, 0);
+    Cmd_Move_Linear(50, 0, 30, 2);       // +X 前进 50 cm, 30 cm/s
+    WaitMoveDone(CMD_LINEAR, 5000);   // 等小车真到位
+    Cmd_Move_Linear(0, 50, 30, 2);       // +Y 左移 50 cm
+    WaitMoveDone(CMD_LINEAR, 5000);
 }
 ```
 
@@ -251,11 +246,11 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 - 检查 USB-TTL 波特率是不是 115200
 - 检查 Keil 是不是勾了 Use MicroLIB（printf 不行就是这个问题）
 
-**Q: 终端有 `[INIT] Subscribe VelPos` 但没有 `[VELPOS]` 数据**
+**Q: 终端有 `[INIT] Subscribe ODOM` 但没有 `[ODOM]` 数据**
 - 检查 USART1 (PA9/PA10) 接小车的线
 - 检查小车有没有上电、有没有激活（未激活的话 OLED 显示"未激活"，需要先用上位机激活）
 
-**Q: 看到 `[VELPOS] (no data yet...)` 一直循环**
+**Q: 看到 `[ODOM] (no data yet...)` 一直循环**
 - 一样是 USART1 接线问题，或者小车没在跑
 
 **Q: 小车不动 / 动作不对**
@@ -281,8 +276,8 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 | 想看什么 | 看哪里 |
 |---|---|
 | 5 条 Cmd_Move_* 的帧布局 + 字段偏移 + 缩放 | `HARDWARE/DFCom_Tx.c` 每个函数前面的大块注释 |
-| 订阅 / 状态查询的协议含义 | `HARDWARE/DFCom_Tx.c::Cmd_Subscribe_VelPos / Cmd_Subscribe_Odom / Cmd_Query_DcarState` |
-| Odom v4 / VelPos v2 payload 布局与缩放 | `HARDWARE/DFCom_Rx.c::parse_odom_v4 / parse_velpos_v2` 顶部注释 |
+| 订阅 / 状态查询的协议含义 | `HARDWARE/DFCom_Tx.c::Cmd_Subscribe_Odom / Cmd_Subscribe_VelPos / Cmd_Query_DcarState` |
+| Odom v4 / VelPos v2 payload 布局 | `HARDWARE/DFCom_Rx.c::parse_odom_v4 / parse_velpos_v2` 顶部注释 |
 | ProgressBack / DcarState 解析 | `HARDWARE/DFCom_Rx.c::parse_move_progress / parse_dcar_state` |
 | 帧定界 + 校验和 + 分发逻辑 | `HARDWARE/DFCom_Rx.c::DFCom_RxParse` |
 | 帧总格式 / 地址校验 | `HARDWARE/DFCom_Tx.c` 顶部、`DFCom_Rx.c` 顶部 |
@@ -319,7 +314,7 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 ============================================
 [INIT] USART1 = 460800 (to DcarON)
 [INIT] USART2 = 115200 (this terminal)
-[INIT] Subscribe VelPos @ 10Hz...
+[INIT] Subscribe ODOM @ 10Hz...
 [INIT] Query DcarState...
 [INIT] DcarState: imu_calibrated=1, finetune=1, par1=1.00 par2=1.00
 [INIT] Waiting 1500ms to check ODOM flow...

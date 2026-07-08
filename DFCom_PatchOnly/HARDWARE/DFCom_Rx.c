@@ -25,8 +25,8 @@
  *
  *   A      B        含义                                  小车端发起位置
  *   ────   ──────   ──────────────────────────────────    ─────────────────────────
- *   0x6C   0x80     IMU_TIME 数据帧 (36B payload)         DF_CoreState.c::DF_IMU_TIME
- *                   含 Acc/Gyro/Yaw(rad s32)/B_Vel/N_Pos/Time
+ *   0x6C   0x80     Odom v4 全量帧 (51B payload)          DF_CoreState.c::DF_Send_odom
+ *   0x6C   0x81     VelPos v2 简化帧 (35B payload)        DF_CoreState.c::DF_Send_vel_pose
  *   0x6F   *        运动完成回传 (ProgressBack, 2B)       DF_CoreFlag.c::DF_Flag_Back
  *                   payload = [Process(0xFF=完成), Notice]
  *   0x8C   0x40     激活/校准状态 (12B payload)           DF_CoreDate.c::DF_DcarParmState
@@ -75,14 +75,6 @@ static u32 read_u32(const u8 *p) {
 
 /*============================================================================
  *  共享 scale 表 (跟小车端 DF_link.h 完全一致)
- *  ──────────────────────────────────────────────────────────────────────────
- *  物理量          | scale  | 量程        | 精度
- *  --------------- |--------|-------------|----------
- *  角度 (rad)      | 10000  | ±3.276 rad  | 0.0057°
- *  加速度 (m/s²)   |   400  | ±8.36g      | 0.0025 m/s²
- *  角速度 (rad/s)  |  1800  | ±1043°/s    | 0.032°/s
- *  速度 (m/s)      |  5000  | ±6.55 m/s   | 0.0002 m/s
- *  位置 (m, s32)   |  1000  | ±2147 km    | 1 mm
  *============================================================================*/
 #define DFCOM_SCALE_ANGLE_RAD   10000.0f
 #define DFCOM_SCALE_ACC_MPS2      400.0f
@@ -92,33 +84,6 @@ static u32 read_u32(const u8 *p) {
 
 /*============================================================================
  *  解析 1：Odom v4 数据帧 (A=0x6C, B=0x80, 51B payload)
- *  ──────────────────────────────────────────────────────────────────────────
- *  全量状态: roll/pitch/yaw + acc + gyro + vel(body/world) + pos(world) + ts
- *  小车端发起: DF_CoreState.c::DF_IMU_TIME
- *
- *    偏移      字段           类型     scale    含义
- *    ────      ───────────    ──────  ───────  ─────────────────────────────
- *    [0]       version        u8       --       0x04 (协议版本)
- *    [1..2]    roll_rad       s16 LE   ×10000  ROS roll (FLU)
- *    [3..4]    pitch_rad      s16 LE   ×10000  ROS pitch (FLU)
- *    [5..6]    yaw_rad        s16 LE   ×10000  ROS yaw (wrap [-π,π])
- *    [7..8]    acc_x          s16 LE   ×400    m/s² (specific force)
- *    [9..10]   acc_y          s16 LE   ×400    m/s²
- *    [11..12]  acc_z          s16 LE   ×400    m/s² (静止 ≈ +9.81)
- *    [13..14]  gyro_x         s16 LE   ×1800   rad/s
- *    [15..16]  gyro_y         s16 LE   ×1800   rad/s
- *    [17..18]  gyro_z         s16 LE   ×1800   rad/s (CCW+)
- *    [19..20]  vel_body_x     s16 LE   ×5000   m/s
- *    [21..22]  vel_body_y     s16 LE   ×5000   m/s
- *    [23..24]  vel_body_z     s16 LE   ×5000   m/s
- *    [25..26]  vel_world_x    s16 LE   ×5000   m/s
- *    [27..28]  vel_world_y    s16 LE   ×5000   m/s
- *    [29..30]  vel_world_z    s16 LE   ×5000   m/s
- *    [31..34]  pos_world_x    s32 LE   ×1000   m
- *    [35..38]  pos_world_y    s32 LE   ×1000   m
- *    [39..42]  pos_world_z    s32 LE   ×1000   m
- *    [43..46]  timestamp_ms   u32 LE   --      启动后毫秒数
- *    [47..50]  timestamp_us   u32 LE   --      毫秒下的微秒部分
  *============================================================================*/
 static void parse_odom_v4(const u8 *payload, u8 payload_len)
 {
@@ -159,25 +124,6 @@ static void parse_odom_v4(const u8 *payload, u8 payload_len)
 
 /*============================================================================
  *  解析 2：VelPos v2 数据帧 (A=0x6C, B=0x81, 35B payload)
- *  ──────────────────────────────────────────────────────────────────────────
- *  简化版: 只有 yaw + vel(body/world) + pos(world) + ts (无 roll/pitch/acc/gyro)
- *  小车端发起: DF_CoreState.c::DF_VelPos_v2
- *
- *    偏移      字段           类型     scale    含义
- *    ────      ───────────    ──────  ───────  ─────────────────────────────
- *    [0]       version        u8       --       0x02 (协议版本)
- *    [1..2]    yaw_rad        s16 LE   ×10000  ROS yaw (CCW+)
- *    [3..4]    vel_body_x     s16 LE   ×5000   m/s
- *    [5..6]    vel_body_y     s16 LE   ×5000   m/s
- *    [7..8]    vel_body_z     s16 LE   ×5000   m/s
- *    [9..10]   vel_world_x    s16 LE   ×5000   m/s
- *    [11..12]  vel_world_y    s16 LE   ×5000   m/s
- *    [13..14]  vel_world_z    s16 LE   ×5000   m/s
- *    [15..18]  pos_world_x    s32 LE   ×1000   m
- *    [19..22]  pos_world_y    s32 LE   ×1000   m
- *    [23..26]  pos_world_z    s32 LE   ×1000   m
- *    [27..30]  timestamp_ms   u32 LE   --      启动后毫秒数
- *    [31..34]  timestamp_us   u32 LE   --      毫秒下的微秒部分
  *============================================================================*/
 static void parse_velpos_v2(const u8 *payload, u8 payload_len)
 {
@@ -340,8 +286,8 @@ void DFCom_RxParse(u8 *data, u16 size)
         payload = &data[hdr + 6];
         switch (A) {
             case 0x6C:   /* 周期数据回传 */
-                if (B == 0x80) parse_odom_v4(payload, len);    /* Odom v4 全量 51B */
-                else if (B == 0x81) parse_velpos_v2(payload, len); /* VelPos v2 简化 35B */
+                if (B == 0x80) parse_odom_v4(payload, len);         /* Odom v4 全量 51B */
+                else if (B == 0x81) parse_velpos_v2(payload, len);  /* VelPos v2 简化 35B */
                 break;
 
             case 0x6F:   /* 运动完成/进度回传 */
@@ -419,7 +365,7 @@ void DFCom_RxParse(u8 *data, u16 size)
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 用法示例 ★
  *
- *    Cmd_Move_Linear(0.5f, 0, 0.3f);    // SI 模式: 前进 0.5m, 速度 0.3m/s
+ *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);    // SI 模式: 前进 0.5m, 速度 0.3m/s
  *    WaitMoveDone(CMD_LINEAR, 0);       // 永久等, 推荐
  *
  *    Cmd_Move_Arc(0.3f, 1.5708f, 0.2f); // 半径 0.3m, +90°, 0.2m/s
@@ -429,7 +375,7 @@ void DFCom_RxParse(u8 *data, u16 size)
  *    WaitMoveDone(CMD_ROT, 0);
  *
  *  示例 (带超时, 必须保守):
- *    Cmd_Move_Linear(0.5f, 0, 0.3f);
+ *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);
  *    if (WaitMoveDone(CMD_LINEAR, 15000) == 0) {     // 15s 兜底
  *        printf("timeout, sending stop\r\n");
  *        Cmd_Move_Velocity(0, 0, 0);                  // 主动停车
@@ -476,6 +422,23 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
                 return 0;
             }
         }
+        /*===== 低功耗优化建议 (高级, 当前未启用) ======================================
+         * 下面这行 delay_ms(10) 是 SysTick 忙等待, 等待期间 CPU 一直在自旋,
+         * 浪费功耗 + 占住 CPU 不能干别的事。
+         *
+         * 如果你想让 CPU 在等待期间睡眠 (省电 + 让出 CPU 给其他任务), 把
+         *      delay_ms(10);
+         * 替换为下面这一行:
+         *      __WFI();    // Wait For Interrupt, ARM Cortex-M 标准指令
+         *
+         * 原理: __WFI() 让 CPU 立刻进入睡眠, 任何中断 (SysTick 1ms / USART RX)
+         *       都会自动唤醒。 这样 CPU 占用从 ~100% 降到 ~0.1%, 行为完全一致。
+         *
+         * 注意: 进入 __WFI 前必须确保 SysTick + USART RX 中断已启用 (默认就是这样,
+         *       不用改); 不要在 __disable_irq() 之后调 __WFI, 否则永远醒不来。
+         *
+         * 我们当前保留 delay_ms(10) 是因为这版例程优先考虑简单易懂, 用户可按需切换。
+         *===========================================================================*/
         delay_ms(10);
     }
 }

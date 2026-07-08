@@ -63,12 +63,12 @@
 #define CMD_LINEAR_WITH_YAW  0x65       /* Motion_LinearWithYaw - 平移+yaw（无头） */
 #define CMD_ARC              0x66       /* Motion_Arc        - 圆弧 */
 
-/* 周期数据订阅模式（Cmd_Subscribe_Odom / Cmd_Subscribe_VelPos 第一个参数） */
+/* ODOM 订阅模式（Cmd_Subscribe_Odom 第一个参数） */
 #define ODOM_MODE_CONTINUOUS 0x01       /* ★ 持续发送（最常用，发一次后小车自己 N Hz 推） */
 #define ODOM_MODE_ONESHOT    0x02       /* 只发一次（用来"拍一帧"快照） */
 #define ODOM_MODE_STOP       0x00       /* 停止发送（内部转成 ONESHOT 实现：发一次后小车自动停）*/
 
-/* 周期数据订阅频率（第二个参数，单位 Hz）
+/* ODOM 订阅频率（Cmd_Subscribe_Odom 第二个参数，单位 Hz）
  * 小车端只接受这 7 个固定频率，其他值会被默默 fallback 到 10Hz: */
 #define ODOM_FREQ_10HZ       10         /* 推荐：肉眼能看清屏幕滚动 */
 #define ODOM_FREQ_50HZ       50         /* 做闭环用 */
@@ -95,16 +95,11 @@
 #define DFCOM_RAD2DEG(rad) ((rad) * 57.29578f)
 #define DFCOM_DEG2RAD(deg) ((deg) * 0.01745329f)
 
-/* ===========================================================================
- * OdomData_t — 全量 Odom v4 数据 (高级用户, 含 IMU 姿态 + 原始数据)
- *   对应小车回传帧: CMD 0x6C 0x80, 51B payload, version=0x04
- *   坐标系: ROS REP-103 FLU (+X 前, +Y 左, +Z 上, CCW+ 逆时针)
- * ===========================================================================*/
 typedef struct {
     /* 姿态 (rad) */
     float roll_rad;         /* ROS roll */
     float pitch_rad;        /* ROS pitch */
-    float yaw_rad;          /* ROS yaw (CCW+ 逆时针为正, 连续累计)
+    float yaw_rad;          /* ROS yaw (CCW+ 逆时针为正, wrap 到 [-pi, pi])
                              * 想看度数: DFCOM_RAD2DEG(g_odom.yaw_rad) */
 
     /* 加速度 (m/s², body 系 specific force, 静止 acc_z ≈ +9.81) */
@@ -145,9 +140,8 @@ typedef struct {
 extern volatile OdomData_t g_odom;
 
 /* ===========================================================================
- * VelPosData_t — 简化版 VelPos v2 数据 (初学者, 只有 yaw + 速度 + 位置)
+ * VelPosData_t — 简化版 VelPos v2 数据 (只有 yaw + 速度 + 位置)
  *   对应小车回传帧: CMD 0x6C 0x81, 35B payload, version=0x02
- *   不含 roll/pitch/acc/gyro, 适合低带宽 / 不需 IMU 解算的应用
  * ===========================================================================*/
 typedef struct {
     float yaw_rad;          /* rad, ROS CCW+ */
@@ -189,7 +183,13 @@ typedef struct {
 extern volatile MoveStatus_t g_move_status[8];  /* 按 cmd_code 索引 (取 cmd & 0x07) */
 
 /* ---------------------------------------------------------------------------
- * 本地毫秒计数 (TIM2 1ms 中断维护) — WaitMoveDone / Startup_Diagnose 等用
+ * 本地毫秒计数 (TIM2 1ms 中断维护)
+ * ---------------------------------------------------------------------------
+ * 应用层可以直接读, 用于:
+ *   - WaitMoveDone 内部超时计时
+ *   - Startup_Diagnose 等回传超时计时
+ *   - 用户自己想做 "等 N 毫秒" 时也可以读这个变量做相对差值
+ * 不可写! 写会被 TIM2 ISR 覆盖。
  * --------------------------------------------------------------------------*/
 extern volatile u32 g_local_tick_ms;
 
@@ -217,19 +217,17 @@ extern volatile DcarState_t g_dcar_state;
  * 默认: DFCOM_UNIT_CM (厘米 + 度, 学生友好)
  *
  * 调用 Cmd_Move_* 时入参的单位会根据这个全局变量自动转换:
- *   - 模式 = MM:       入参为 毫米 / 毫米每秒 / 度 / 度每秒 (精度高, 适合机械臂/精确定位)
- *   - 模式 = CM (默认): 入参为 厘米 / 厘米每秒 / 度 / 度每秒 (适合教学/普通场景)
- *   - 模式 = M:         入参为 米   / 米每秒    / 弧度 / 弧度每秒 (协议原生 SI)
+ *   - 模式 = CM (默认): 入参为 厘米 / 厘米每秒 / 度 / 度每秒
+ *   - 模式 = M:        入参为 米   / 米每秒    / 弧度 / 弧度每秒 (协议原生 SI)
  *
  * 内部转换后, 协议层永远是 SI (米 + rad), 小车端不需要知道这件事。
  *
  * 接收侧 g_odom / g_velpos 字段不受这个开关影响, 永远是 SI 原生
- * (想看 cm/mm/deg, 自己 *100 / *1000 / DFCOM_RAD2DEG() 转一下)。
+ * (想看 cm/deg, 自己用 *100 / DFCOM_RAD2DEG() 转一下)。
  * ===========================================================================*/
 typedef enum {
     DFCOM_UNIT_CM = 0,   /* ★ 默认: 厘米 + 度 (适合学生 / 初学者) */
-    DFCOM_UNIT_M  = 1,   /* 米 + 弧度 (SI, 协议原生, 数值更小) */
-    DFCOM_UNIT_MM = 2    /* 毫米 + 度 (精确定位场景, 数值更直观) */
+    DFCOM_UNIT_M  = 1    /* 米 + 弧度 (SI, 协议原生, 数值更小) */
 } DFCom_UnitMode_e;
 
 extern u8 g_dfcom_unit_mode;   /* 默认 = DFCOM_UNIT_CM */
@@ -273,20 +271,20 @@ extern u8 g_dfcom_unit_mode;   /* 默认 = DFCOM_UNIT_CM */
  *    Cmd_Move_Vel:           持续速度（不会自动停！要主动 (0,0,0) 停车）
  *    Cmd_Move_Arc:           radius>0 半径; 转向只看 dyaw 符号 (CCW+ 左转, CW- 右转)
  *  ────────────────────────────────────────────────────────────────────────*/
-/* ★ profile 参数: 0=匀速 (CONST, 起停硬), 1=加减速 (TRAPEZOID, 平滑, ★ 推荐) */
-void Cmd_Move_Linear        (float px, float py, float speed_mps, u8 profile);                  /* 0x64 直线位移 */
-void Cmd_Move_LinearWithYaw (float px, float py, float dyaw_rad, float speed_mps, u8 profile);  /* 0x65 平移+yaw（无头） */
-void Cmd_Move_Rot           (float dyaw_rad, float omega_max_rad_s);                /* 0x63 原地旋转（增量） */
-void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);           /* 0x62 持续速度（无完成回传） */
-void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);      /* 0x66 圆弧 */
+/* ★ profile 参数: 0=匀速, 1=梯形加减速, 2=高精度距离闭环 */
+void Cmd_Move_Linear        (float px, float py, float speed_mps, u8 profile);                          /* 0x64 直线位移 */
+void Cmd_Move_LinearWithYaw (float px, float py, float dyaw_rad, float speed_mps, u8 profile);          /* 0x65 平移+yaw（无头） */
+void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);              /* 0x66 圆弧 */
+void Cmd_Move_Rot           (float dyaw_rad, float omega_max_rad_s);                                    /* 0x63 原地旋转（无 profile） */
+void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);                               /* 0x62 持续速度（无完成回传） */
 
-/* 周期数据订阅：发一次小车就持续发送
+/* ODOM/VelPos 订阅：发一次小车就持续发送
  *   mode: ODOM_MODE_CONTINUOUS / ODOM_MODE_ONESHOT / ODOM_MODE_STOP
  *   freq_hz: 10/50/100/200/250/500（小车协议枚举，其他自动 fallback 到 10）
- * 教学常用：Cmd_Subscribe_VelPos(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
+ * 教学常用：Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
  */
-void Cmd_Subscribe_Odom (u8 mode, u8 freq_hz);
-void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz);
+void Cmd_Subscribe_Odom   (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_VelPos (u8 mode, u8 freq_hz);
 
 /* 查询小车激活/校准状态（启动诊断用）
  * 发完后等 100~500ms，读 g_dcar_state.received/imu_calibrated
@@ -294,7 +292,7 @@ void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz);
 void Cmd_Query_DcarState(void);
 
 /* ---- Rx 接收侧（DFCom_Rx.c）：在 USART1 IDLE 中断里自动调用 ---- */
-void DFCom_RxParse(u8 *data, u16 size);  /* 协议解析入口（中断里调） */
+void DFCom_RxParse(u8 *data, u16 size);  /* 协议解析入口（中断里调）, size 是 u16 (buffer 256B) */
 
 /* ---- 可选辅助 ---- */
 
@@ -314,8 +312,8 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms);
 u8 GetMoveProgress(u8 cmd_code);
 
 /* ---- Print（DFCom_Print.c）：TIM2 中断自动调用 ---- */
-void VelPos_Print(void);            /* VelPos v2 简化版 (默认调) */
-void Odom_Print(void);              /* Odom v4 全量版 (进阶用, 默认 TIM2 里注释) */
+void VelPos_Print(void);            /* VelPos v2 简化版 */
+void Odom_Print(void);              /* Odom v4 全量版 */
 void Odom_PrintTimer_Init(void);    /* 启动 10Hz 自动打印 */
 
 #endif /* __DFCOM_H */
