@@ -63,6 +63,16 @@
 #define CMD_LINEAR_WITH_YAW  0x65       /* Motion_LinearWithYaw - 平移+yaw（无头） */
 #define CMD_ARC              0x66       /* Motion_Arc        - 圆弧 */
 
+/* WaitMoveDone 返回值 */
+#define MOVE_WAIT_TIMEOUT      0        /* 等待超时 */
+#define MOVE_WAIT_DONE         1        /* 自然到位: progress=0xFF, notice=0x00 */
+#define MOVE_WAIT_INTERRUPTED  2        /* 被打断:   progress=0xFF, notice!=0x00 */
+
+/* 完成帧 notice：新运动指令打断时，notice 就是对应的 CMD_xxx */
+#define MOVE_NOTICE_NONE         0x00
+#define MOVE_NOTICE_REJECTED     0x01   /* 版本不支持或参数非法，任务未启动 */
+#define MOVE_NOTICE_RC_TAKEOVER  0x0A   /* 遥控器接管 */
+
 /* ODOM 订阅模式（Cmd_Subscribe_Odom 第一个参数） */
 #define ODOM_MODE_CONTINUOUS 0x01       /* ★ 持续发送（最常用，发一次后小车自己 N Hz 推） */
 #define ODOM_MODE_ONESHOT    0x02       /* 只发一次（用来"拍一帧"快照） */
@@ -86,7 +96,7 @@
  *    g_odom.n_pos_y_m  = 世界系 +Y 方向位移（开机起累计），+Y = 左方
  *    g_odom.b_vel_x_mps = 车体系 Vx（前进为正）
  *    g_odom.b_vel_y_mps = 车体系 Vy（左方为正）
- *    g_odom.yaw_rad    = 累计 Yaw 角，单位弧度 (rad)，CCW（逆时针）为正
+ *    g_odom.yaw_rad    = 当前航向角，单位弧度 (rad)，CCW（逆时针）为正，范围 [-pi, pi]
  *      ↑ 协议层 IMU_TIME 回传 SI rad（s32/10000），与发送层一致。
  *      ↑ 想看度数：DFCOM_RAD2DEG(g_odom.yaw_rad) 或 *57.29578f
  * ===========================================================================*/
@@ -104,7 +114,7 @@ typedef struct {
     /* 姿态 (rad) */
     float roll_rad;         /* ROS roll */
     float pitch_rad;        /* ROS pitch */
-    float yaw_rad;          /* ROS yaw (CCW+ 逆时针为正, 连续累计)
+    float yaw_rad;          /* ROS yaw (CCW+ 逆时针为正, wrap 到 [-pi, pi])
                              * 想看度数: DFCOM_RAD2DEG(g_odom.yaw_rad) */
 
     /* 加速度 (m/s², body 系 specific force, 静止 acc_z ≈ +9.81) */
@@ -301,7 +311,8 @@ void DFCom_RxParse(u8 *data, u16 size);  /* 协议解析入口（中断里调）
 /* 等待最近一条运动指令完成（阻塞，会自动调 Odom_Print 不中断显示）
  *   cmd_code:    CMD_LINEAR / CMD_LINEAR_WITH_YAW / CMD_ROT / CMD_ARC
  *   timeout_ms:  0 = 无限等
- * 返回: 1=完成, 0=超时
+ * 返回: MOVE_WAIT_DONE / MOVE_WAIT_TIMEOUT / MOVE_WAIT_INTERRUPTED
+ * 被打断时可用 GetMoveNotice(cmd_code) 读取原因码
  *
  * ★ 给学生的提示：★
  *   - 想"发完就跑下一条"：不用这个函数（删掉就行）
@@ -312,6 +323,9 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms);
 
 /* 进度查询（不阻塞，返回 0~254 进度 / 255 完成 / 0=未开始） */
 u8 GetMoveProgress(u8 cmd_code);
+
+/* 最近一次完成帧 notice（0=完成, 1=拒绝, 0x0A=RC接管, CMD_xxx=新指令打断） */
+u8 GetMoveNotice(u8 cmd_code);
 
 /* ---- Print（DFCom_Print.c）：TIM2 中断自动调用 ---- */
 void VelPos_Print(void);            /* VelPos v2 简化版 (默认调) */

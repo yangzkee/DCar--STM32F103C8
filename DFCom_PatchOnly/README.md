@@ -166,7 +166,7 @@ Cmd_Subscribe_Odom(ODOM_MODE_STOP,       0);   // 停止推送
 ```c
 extern volatile OdomData_t g_odom;
 
-g_odom.yaw_rad       // 累计 Yaw 角（单位 rad, CCW+ 逆时针为正）
+g_odom.yaw_rad       // 当前航向角（单位 rad，CCW+，范围 [-π, π]；多圈累计需自行 unwrap）
 g_odom.n_pos_x_m     // 世界系 +X 前进 位置（米）
 g_odom.n_pos_y_m     // 世界系 +Y 左方 位置（米）
 g_odom.b_vel_x_mps   // 车体系 Vx 前进 (m/s)

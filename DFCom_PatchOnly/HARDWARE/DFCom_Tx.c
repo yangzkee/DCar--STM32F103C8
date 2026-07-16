@@ -122,9 +122,8 @@ static void send_frame(u8 *buf, u8 len)
  *   WaitMoveDone 通过 g_move_status[cmd & 0x07] 判断完成。
  *   如果上一条 Motion_* 被打断, MCU 会发 progress=0xFF / notice!=0 回传,
  *   这条回传会停留在 g_move_status 里。
- *   下一条 Cmd_Move_* 发出后, 如果不清零, 客户端可能在 WaitMoveDone
- *   入口清零和新回传到达之间出现时序竞争, 把上一条的残留误读成本条完成。
- *   所以发送侧主动清零, 双保险。
+ *   所以发送侧必须在发帧前清零。WaitMoveDone 只读状态，不再二次清零，
+ *   避免版本拒绝/零距离等快速终止帧刚到就被等待函数抹掉。
  *
  * 只有有完成回传的命令需要清 (LINEAR / LINEAR_WITH_YAW / ROT / ARC)。
  * VEL (持续速度) 没有完成回传, 不需要清。

@@ -161,7 +161,9 @@ static void parse_velpos_v2(const u8 *payload, u8 payload_len)
  *
  *    [0] Process  u8   0..0xFE = 进度比例（×255/100），0xFF = 完成
  *    [1] Notice   u8   0       = 正常完成
- *                      其他    = 被打断（值 = 中断 type，比如新指令的 cmd）
+ *                      1       = 版本不支持或参数非法，任务未启动
+ *                      0x0A    = 遥控器接管
+ *                      0x62~66 = 被对应的新运动指令打断
  *
  *  B 字段 = 原指令的 cmd 码：
  *    0x62 = CMD_VEL          (持续速度无回传, 一般不会到这)
@@ -352,15 +354,18 @@ void DFCom_RxParse(u8 *data, u16 size)
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 返回值 ★
  *
- *  返回 1  →  ★ 自然完成 ★ (progress=0xFF + last_notice=0x00)
- *  返回 0  →  超时 (timeout_ms>0 时才会发生)
+ *  返回 MOVE_WAIT_DONE        → 自然完成 (progress=0xFF + notice=0x00)
+ *  返回 MOVE_WAIT_TIMEOUT     → 超时 (timeout_ms>0 时才会发生)
+ *  返回 MOVE_WAIT_INTERRUPTED → 被打断 (progress=0xFF + notice!=0x00)
  *
  *  ⚠️ 重要: 这一版修过了 "被打断也算完成" 的 bug
  *  从前 progress=0xFF 就直接 return 1, 但 0xFF 有两个含义:
  *    last_notice=0x00 → 自然完成 (车真的到位了)
- *    last_notice=非零 → 被打断 (新指令进来 / RC 接管 / 撞到东西)
+ *    last_notice=0x01 → 任务被拒绝 (版本不支持或参数非法)
+ *    last_notice=0x0A → 被遥控器接管
+ *    last_notice=0x62~0x66 → 被对应的新运动指令打断
  *  老代码不区分, 把 "被打断" 当 "完成", 直接造成雪崩。
- *  这一版加上 last_notice==0 判定后, 只有真正自然完成才 return 1。
+ *  现在自然完成返回 MOVE_WAIT_DONE, 被打断返回 MOVE_WAIT_INTERRUPTED。
  *
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 用法示例 ★
@@ -385,41 +390,42 @@ void DFCom_RxParse(u8 *data, u16 size)
 u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
 {
     u8 idx = cmd_code & 0x07;
+    u8 notice;
     u32 start;
-    /* 入口清掉对应槽位的残留, 防止上一轮回传被误读 */
-    g_move_status[idx].progress    = 0;
-    g_move_status[idx].last_notice = 0;
-    g_move_status[idx].fresh       = 0;
+    /* Cmd_Move_* 已在发送前清槽。这里不能再清，否则会抹掉已经快速返回的终止帧。 */
 
     start = g_local_tick_ms;
     /* ★★★ 诊断 printf (2026-05-26 加, 定位 "1 秒超时不退出" 问题) ★★★
-     * 跑一次抓 USART2 log, 看 IN / DONE / TIMEOUT 三种事件能不能配对。
+     * 跑一次抓 USART2 log, 看 IN / DONE / INTERRUPTED / TIMEOUT 能不能配对。
      * 验证完根因后这三行可以删掉。 */
     printf("[WAIT.IN]  cmd=0x%02X tmo=%lu start_tick=%lu\r\n",
            (unsigned)cmd_code, (unsigned long)timeout_ms, (unsigned long)start);
 
     while (1) {
-        /* ★ 关键修复 ★
-         *   原来只看 progress==0xFF, 把 "被打断的完成" (notice!=0)
-         *   也误判为 "自然完成", 是雪崩的根因。
-         *   现在必须 progress==0xFF AND last_notice==0 才算真正完成。
-         *   被打断时 (notice!=0) 继续等 → 客户端不会被骗着疯发下一条。
-         */
+        /* 终止帧统一由 progress=0xFF 标识，notice 决定自然完成或被打断。 */
         if (g_move_status[idx].fresh &&
-            g_move_status[idx].progress    == 0xFF &&
-            g_move_status[idx].last_notice == 0x00) {
-            printf("[WAIT.DONE] cmd=0x%02X waited=%lums\r\n",
+            g_move_status[idx].progress == 0xFF) {
+            notice = g_move_status[idx].last_notice;
+            if (notice == MOVE_NOTICE_NONE) {
+                printf("[WAIT.DONE] cmd=0x%02X waited=%lums\r\n",
+                       (unsigned)cmd_code,
+                       (unsigned long)(g_local_tick_ms - start));
+                return MOVE_WAIT_DONE;
+            }
+
+            printf("[WAIT.INTERRUPTED] cmd=0x%02X notice=0x%02X waited=%lums\r\n",
                    (unsigned)cmd_code,
+                   (unsigned)notice,
                    (unsigned long)(g_local_tick_ms - start));
-            return 1;   /* ✓ 自然完成 */
+            return MOVE_WAIT_INTERRUPTED;
         }
         if (timeout_ms != 0) {                /* timeout_ms == 0 ⇒ 永久等待 */
             if ((g_local_tick_ms - start) > timeout_ms) {
-                printf("[WAIT.TIMEOUT] cmd=0x%02X waited=%lums now_tick=%lu (没等到 progress=FF/notice=00)\r\n",
+                printf("[WAIT.TIMEOUT] cmd=0x%02X waited=%lums now_tick=%lu (没等到 progress=FF)\r\n",
                        (unsigned)cmd_code,
                        (unsigned long)(g_local_tick_ms - start),
                        (unsigned long)g_local_tick_ms);
-                return 0;
+                return MOVE_WAIT_TIMEOUT;
             }
         }
         /*===== 低功耗优化建议 (高级, 当前未启用) ======================================
@@ -447,4 +453,10 @@ u8 GetMoveProgress(u8 cmd_code)
 {
     u8 idx = cmd_code & 0x07;
     return g_move_status[idx].progress;
+}
+
+u8 GetMoveNotice(u8 cmd_code)
+{
+    u8 idx = cmd_code & 0x07;
+    return g_move_status[idx].last_notice;
 }
