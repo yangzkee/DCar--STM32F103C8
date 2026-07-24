@@ -1,7 +1,7 @@
 /******************************************************************************
  * DFCom.h - Differ Tech 小车通信库（精简版，面向教学）
  * ---------------------------------------------------------------------------
- * 适用：STM32F103ZET6 + DcarON 系列小车（DF-Link 协议 / SI 单位 / ROS REP-103）
+ * 适用：STM32F103C8T6 + DcarON 系列小车（DF-Link 协议 / SI 单位 / ROS REP-103）
  * 官网：https://differ-tech.pages.dev/
  *
  * 库结构（拆成三个文件，互不依赖）：
@@ -9,7 +9,7 @@
  *   DFCom_Rx.c    — 接收侧（自动收+解析 ODOM 数据）
  *   DFCom_Print.c — 终端打印（10Hz 定时器自动把 ODOM 打到 USART2）
  *
- * 硬件接线（F103ZET6）：
+ * 硬件接线（F103C8T6）：
  *   USART1 (PA9/PA10)  @460800  → 接 DcarON 小车（必接）
  *   USART2 (PA2/PA3)   @115200  → 接 USB-TTL 看终端（必接，看 ODOM 数据用）
  *
@@ -86,7 +86,6 @@
 #define ODOM_FREQ_200HZ      200
 #define ODOM_FREQ_250HZ      250
 #define ODOM_FREQ_500HZ      500
-/* 1000Hz 协议支持但本库 u8 参数表达不下；如需要请改函数为 u16 参数 */
 
 /* ===========================================================================
  * 2. 接收到的 ODOM 数据（应用直接读 g_odom）
@@ -191,12 +190,14 @@ extern volatile VelPosData_t g_velpos;
  * 3. 运动状态（应用通常不用直接读，给 WaitMoveDone 内部用）
  * ===========================================================================*/
 typedef struct {
+    u8 cmd_code;     /* 当前槽绑定的命令码；0 = 空槽 */
     u8 progress;     /* 0~0xFE = 进度%×255, 0xFF = 完成 */
     u8 last_notice;  /* 最近一次回传的 notice 字节（0=正常完成, 其他=中断码） */
     u8 fresh;        /* 1 = 有新进度回传 */
 } MoveStatus_t;
 
-extern volatile MoveStatus_t g_move_status[8];  /* 按 cmd_code 索引 (取 cmd & 0x07) */
+/* 两个槽按发送顺序 A/B/A/B 交替；相邻任务永远不会共用一个槽。 */
+extern volatile MoveStatus_t g_move_status[2];
 
 /* ---------------------------------------------------------------------------
  * 本地毫秒计数 (TIM2 1ms 中断维护) — WaitMoveDone / Startup_Diagnose 等用
@@ -295,8 +296,8 @@ void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8
  *   freq_hz: 10/50/100/200/250/500（小车协议枚举，其他自动 fallback 到 10）
  * 教学常用：Cmd_Subscribe_Odom(ODOM_MODE_CONTINUOUS, ODOM_FREQ_10HZ);
  */
-void Cmd_Subscribe_Odom   (u8 mode, u8 freq_hz);
-void Cmd_Subscribe_VelPos (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_Odom   (u8 mode, u16 freq_hz);
+void Cmd_Subscribe_VelPos (u8 mode, u16 freq_hz);
 
 /* 查询小车激活/校准状态（启动诊断用）
  * 发完后等 100~500ms，读 g_dcar_state.received/imu_calibrated
@@ -306,17 +307,25 @@ void Cmd_Query_DcarState(void);
 /* ---- Rx 接收侧（DFCom_Rx.c）：在 USART1 IDLE 中断里自动调用 ---- */
 void DFCom_RxParse(u8 *data, u16 size);  /* 协议解析入口（中断里调） */
 
+/* ---- 启动阶段的运动回传隔离 ----
+ * Quarantine: 丢弃全部 A=0x6F，供上电停车/诊断阶段隔离旧回传。
+ * Start:      清空 A/B 两槽后开始接收业务运动回传。
+ */
+void DFCom_MoveSessionQuarantine(void);
+void DFCom_MoveSessionStart(void);
+
 /* ---- 可选辅助 ---- */
 
-/* 等待最近一条运动指令完成（阻塞，会自动调 Odom_Print 不中断显示）
+/* 等待最近一条运动指令完成（阻塞；ODOM 的定时打印仍由中断继续）
  *   cmd_code:    CMD_LINEAR / CMD_LINEAR_WITH_YAW / CMD_ROT / CMD_ARC
- *   timeout_ms:  0 = 无限等
+ *   timeout_ms:  0 = 无限等；>0 = 允许该任务执行的最长时间
  * 返回: MOVE_WAIT_DONE / MOVE_WAIT_TIMEOUT / MOVE_WAIT_INTERRUPTED
  * 被打断时可用 GetMoveNotice(cmd_code) 读取原因码
  *
  * ★ 给学生的提示：★
  *   - 想"发完就跑下一条"：不用这个函数（删掉就行）
- *   - 想"等小车真到位再发下一条"：每条 Cmd_Move_* 后调一次
+ *   - 在 timeout 内到位会立刻返回；到点仍未完成就返回 TIMEOUT，
+ *     随后发送的下一条运动命令会按协议合法打断上一条
  *   - CMD_VEL (持续速度) 没有完成回传，别用 WaitMoveDone 等它
  */
 u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms);

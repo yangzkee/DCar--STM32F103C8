@@ -1,6 +1,6 @@
-# DCar 官方小车例程 - STM32F103C8 / DFCom v2
+# DCar 官方小车例程 - STM32F103C8T6 / DFCom v2
 
-适用于 STM32F103C8 的 DCar / DcarON 小车底盘通信例程，现已对齐 DFCom v2 协议。  
+适用于 STM32F103C8T6 的 DCar / DcarON 小车底盘通信例程，现已对齐 DFCom v2 协议。
 
 产品与教程页面：  
 https://differ-tech.pages.dev/portal/view/dcar-fast-motion-control
@@ -14,6 +14,8 @@ https://differ-tech.pages.dev/portal/view/dcar-fast-motion-control
 ├── DFCom_Example/          # STM32 Keil 示例工程（主线）
 ├── DFCom_PatchOnly/        # 通信核心文件（用于移植）
 ├── DFCom_Arduino/          # Arduino 库 + 示例（新增）
+├── tests/host/             # STM32 DFCom 收发/运动槽离线时序测试
+├── tests/arduino/          # Arduino 库与单文件版离线时序测试
 ├── MG520_Firmware_Update... # MG520 固件更新包
 └── README.md               # 本说明
 ```
@@ -25,15 +27,15 @@ https://differ-tech.pages.dev/portal/view/dcar-fast-motion-control
 
 两条路径共用同一套协议、坐标系和动作语义。
 
-## 硬件接线（STM32F103C8）
+## 硬件接线（STM32F103C8T6）
 
-| STM32F103C8 引脚 | 连接到小车底盘 | 用途 | 参数 |
+| STM32F103C8T6 引脚 | 连接到小车底盘 | 用途 | 参数 |
 |---|---|---|---|
 | PA9 / USART1_TX | 小车 UART_RX | 发送控制指令 | 460800, 8N1 |
 | PA10 / USART1_RX | 小车 UART_TX | 接收 ODOM/VelPos 回传 | 460800, 8N1 |
 | GND | 小车 GND | 共地 | 必接 |
 
-| STM32F103C8 引脚 | 连接到 USB-TTL | 用途 | 参数 |
+| STM32F103C8T6 引脚 | 连接到 USB-TTL | 用途 | 参数 |
 |---|---|---|---|
 | PA2 / USART2_TX | USB-TTL RX | 串口打印（printf） | 115200, 8N1 |
 | PA3 / USART2_RX | USB-TTL TX | 预留接收 | 115200, 8N1 |
@@ -48,7 +50,8 @@ https://differ-tech.pages.dev/portal/view/dcar-fast-motion-control
 ### Keil MDK（推荐，STM32）
 
 1. 安装 Keil MDK5（本工程使用 ARM Compiler 5）。
-2. 安装 STM32F1 Device Family Pack，目标芯片 `STM32F103C8`。
+2. 安装 STM32F1 Device Family Pack；C8T6 在 Keil 器件库中的目标名为
+   `STM32F103C8`。
 3. 打开工程：`DFCom_Example/USER/Template.uvprojx`。
 4. 编译前检查：
    - Target Device：`STM32F103C8`
@@ -75,8 +78,12 @@ https://ucnerk2uhr85.feishu.cn/wiki/BaUMwzR4liGc6FkMES1c64c6nOb?renamingWikiNode
 ```text
 [INIT] Subscribe ODOM + VelPos @ 10Hz...
 [INIT] ODOM data flowing ✓
+[INIT] Motion session ready (A/B slots cleared)
 [ODOM] Yaw= ... X(fwd)=... Y(left)=... Vx=... Vy=... Gz=...
 ```
+
+上电流程会立即发送零速度，等待 DCar 供电稳定后再发送一次零速度；在此期间
+隔离旧运动回传，最后清空 A/B 任务槽再开放正式运动序列。
 
 5. 修改 `DFCom_Example/USER/main.c` 里 `while(1)` 的运动逻辑即可。
 
@@ -127,14 +134,34 @@ void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);
 ### 订阅与状态
 
 ```c
-void Cmd_Subscribe_Odom    (u8 mode, u8 freq_hz);
-void Cmd_Subscribe_VelPos  (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_Odom    (u8 mode, u16 freq_hz);
+void Cmd_Subscribe_VelPos  (u8 mode, u16 freq_hz);
 void Cmd_Query_DcarState   (void);
 u8   WaitMoveDone         (u8 cmd_code, u32 timeout_ms);
 u8   GetMoveProgress      (u8 cmd_code);
 ```
 
 > 建议新手先用 `WaitMoveDone` 验证每一步到位，再进入闭环控制与进度查询。
+
+`timeout_ms > 0` 表示任务允许执行的最长时间：提前到位就立即返回；到达时限
+仍未完成则返回 `MOVE_WAIT_TIMEOUT`，随后发出的下一条运动命令会按协议合法
+打断上一条。`timeout_ms == 0` 才是永久等待。
+
+STM32 与 Arduino 客户端对有界运动都使用 A/B 两个槽按发送次序交替，旧槽
+只负责吞掉上一任务随后到达的进度/终止帧，防止连续同类型指令把旧 `0xFF`
+误认成新任务完成。
+
+DFLink 回传不含 task id，因此“旧任务唯一终止帧在客户端丢失”时无法做到
+数学上的无歧义。实现采用安全侧策略：模糊的同命令码 `FF` 宁可丢弃，使当前
+等待走满设定上限，也不把它当成新任务完成而提前跳指令；有界超时保证序列
+仍会继续，切换到不同命令码后路由会重新明确。
+
+运行离线回归测试：
+
+```sh
+sh tests/host/run_move_slots_tests.sh
+sh tests/arduino/run_arduino_tests.sh
+```
 
 ## 常见问题
 
@@ -152,7 +179,7 @@ u8   GetMoveProgress      (u8 cmd_code);
 
 ## Release 包
 
-当前 Release（v1.0.0）提供：
+当前发布内容提供：
 
-- `DCar-STM32F103C8-Keil.zip`：STM32 Keil 版完整工程
-- `DCar-STM32F103C8-Arduino.zip`：DFCom Arduino 版库与示例
+- `DCar-STM32F103C8T6-Keil.zip`：STM32 Keil 版完整工程
+- `DCar-STM32F103C8T6-Arduino.zip`：DFCom Arduino 版库与示例

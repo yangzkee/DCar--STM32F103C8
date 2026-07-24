@@ -20,8 +20,8 @@
  *    #include <DFCom.h>
  *    void setup(){ DFCom.begin(); DFCom.subscribeOdom(10); }
  *    void loop(){
- *      DFCom.moveLinear(50, 0, 30, 2);  DFCom.waitDone();   // 前进 50cm
- *      DFCom.moveRot(90);            DFCom.waitDone();   // 左转 90°
+ *      DFCom.moveLinear(50, 0, 30, 2); DFCom.waitDone(10000); // 前进 50cm
+ *      DFCom.moveRot(90);             DFCom.waitDone(10000); // 左转 90°
  *    }
  ******************************************************************************/
 #ifndef DFCOM_H
@@ -87,7 +87,7 @@ struct DFState {
 
 class DFCom_t {
 public:
-    /* ---- 初始化 ---- */
+    /* ---- 初始化（内部会先停车并隔离旧运动回传） ---- */
     void begin(long baud = 115200, HardwareSerial &port = Serial);
     void setDebug(Stream &dbg) { _dbg = &dbg; }   /* 可选: 接 SoftwareSerial 看打印 */
 
@@ -107,8 +107,8 @@ public:
     void stop() { moveVel(0, 0, 0); }                 /* 主动停车 */
 
     /* ---- 里程计订阅 / 状态查询 ---- */
-    void subscribeOdom(uint8_t freqHz = 10, uint8_t mode = DFCOM_MODE_CONTINUOUS);
-    void subscribeVelPos(uint8_t freqHz = 10, uint8_t mode = DFCOM_MODE_CONTINUOUS);
+    void subscribeOdom(uint16_t freqHz = 10, uint8_t mode = DFCOM_MODE_CONTINUOUS);
+    void subscribeVelPos(uint16_t freqHz = 10, uint8_t mode = DFCOM_MODE_CONTINUOUS);
     void queryState();
 
     /* ---- 必须在 loop() 里(或 waitDone 内部)调, 收+解析回传 ---- */
@@ -116,11 +116,12 @@ public:
 
     /* ---- 等运动完成 (阻塞, 内部自动 update) ----
      *   waitDone()            等最近一条运动指令
-     *   waitDone(cmd, tmo_ms) 指定指令; tmo=0 永久等(推荐)
-     *   返回 true=完成, false=超时 */
+     *   waitDone(cmd, tmo_ms) 指定指令; tmo=0 表示永久等待
+     *   tmo>0 是最长执行时间: 提前到位就提前返回, 到时可发下一条打断
+     *   返回 true=自然完成, false=超时/中断/发送失败 */
     bool waitDone(uint32_t timeoutMs = 0) { return waitDone(_lastCmd, timeoutMs); }
     bool waitDone(uint8_t cmdCode, uint32_t timeoutMs);
-    uint8_t progress(uint8_t cmdCode) { return _mvProg[cmdCode & 0x07]; }
+    uint8_t progress(uint8_t cmdCode);
 
     /* ---- 数据 (SI 原生, 直接读) ---- */
     DFOdom   odom;
@@ -139,10 +140,21 @@ private:
     uint8_t _unit = DFCOM_UNIT_CM;
     uint8_t _lastCmd = DFCOM_CMD_LINEAR;
 
-    /* 运动完成槽 (按 cmd&0x07 索引) */
-    volatile uint8_t _mvProg[8];
-    volatile uint8_t _mvNotice[8];
-    volatile uint8_t _mvFresh[8];
+    struct MoveSlot {
+        uint8_t cmd;
+        uint8_t progress;
+        uint8_t notice;
+        uint8_t fresh;
+    };
+
+    /* 两槽按本地发送顺序交替；上一任务的尾帧只进入丢弃槽。 */
+    MoveSlot _moveSlots[2];
+    uint8_t _currentSlot = 0xFF;
+    uint8_t _discardSlot = 0xFF;
+    uint8_t _discardCmd = 0;
+    uint8_t _motionSessionActive = 0;
+    uint8_t _sendFailed = 0;
+    uint8_t _failedCmd = 0;
 
     /* 字节流解析状态机 */
     uint8_t _buf[72];
@@ -150,10 +162,18 @@ private:
     uint8_t _st = 0;       /* 0=找头 1=收头部 2=收剩余 */
     uint8_t _need = 0;     /* 整帧总长 */
 
-    void _frame(uint8_t A, uint8_t B, const uint8_t *payload, uint8_t len);  /* 建帧+校验+发送 */
+    bool _frame(uint8_t A, uint8_t B, const uint8_t *payload, uint8_t len);  /* 建帧+校验+发送 */
     void _feed(uint8_t byteIn);                                              /* 字节流解析 */
     void _dispatch(uint8_t A, uint8_t B, const uint8_t *p, uint8_t len);
-    void _clearSlot(uint8_t cmd);
+    static bool _isBoundedMotion(uint8_t cmd);
+    void _clearMoveSlot(uint8_t slot);
+    void _releaseDiscard();
+    void _retireCurrent();
+    uint8_t _nextMoveSlot() const;
+    void _resetMotionSession(uint8_t active);
+    void _motionSent(uint8_t cmd);
+    void _motionSendFailed(uint8_t cmd);
+    void _routeMotionProgress(uint8_t cmd, uint8_t progress, uint8_t notice);
     float _toM(float v);     /* 长度入参 → 米 (按单位模式) */
     float _toRad(float v);   /* 角度入参 → 弧度 (按单位模式) */
 };

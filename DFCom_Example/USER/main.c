@@ -2,7 +2,7 @@
  *
  *   ╔══════════════════════════════════════════════════════════════════════╗
  *   ║                                                                      ║
- *   ║       DcarON DFCom 客户端例程 (精简版) - STM32F103ZET6 裸机          ║
+ *   ║       DcarON DFCom 客户端例程 (精简版) - STM32F103C8T6 裸机          ║
  *   ║       协议版本: SI + ROS REP-103 (m / m/s / rad / +X 前 +Y 左)       ║
  *   ║                                                                      ║
  *   ║              官方网站：https://differ-tech.pages.dev/                ║
@@ -14,7 +14,7 @@
  *  ▌ 一、硬件接线
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *
- *  STM32F103ZET6 板子 ←→ 接线对象
+ *  STM32F103C8T6 板子 ←→ 接线对象
  *
  *  ┌──────────────────────────────────────┬─────────────────────────────────┐
  *  │ STM32 引脚                            │ 接到                            │
@@ -51,7 +51,7 @@
  *  6. 给 STM32 上电，应该看到下面这样的输出：
  *
  *       ============================================
- *         DcarON DFCom Client - STM32F103ZET6
+ *         DcarON DFCom Client - STM32F103C8T6
  *         https://differ-tech.pages.dev/
  *       ============================================
  *       [INIT] USART1 = 460800 (to DcarON)
@@ -119,9 +119,8 @@
  *
  *  🟡 进阶 (等小车真到位):
  *      Cmd_Move_Linear(50, 0, 30, 2); // 第 4 参 profile: 2=高精度距离闭环
- *      WaitMoveDone(CMD_LINEAR, 0);    // ★ 第二参 0 = 永久等待 (推荐!)
- *                                      //   传 0 = 一直等到 MCU 真正回传完成
- *                                      //   不要设小的超时 (e.g. 5000ms), 会触发"雪崩吃单" bug
+ *      WaitMoveDone(CMD_LINEAR, 1000); // 最多执行 1s；提前到位就提前返回
+ *                                      //   传 0 才表示永久等待
  *                                      //   ─── 第一参 cmd_code 必须跟刚发的函数对应:
  *                                      //       Cmd_Move_Linear         → CMD_LINEAR
  *                                      //       Cmd_Move_LinearWithYaw  → CMD_LINEAR_WITH_YAW
@@ -212,7 +211,7 @@ static void Startup_Diagnose(void)
 
     printf("\r\n");
     printf("============================================\r\n");
-    printf("  DcarON DFCom Client - STM32F103ZET6\r\n");
+    printf("  DcarON DFCom Client - STM32F103C8T6\r\n");
     printf("  Protocol: SI + ROS REP-103 (+X fwd, +Y left)\r\n");
     printf("  https://differ-tech.pages.dev/\r\n");
     printf("============================================\r\n");
@@ -299,7 +298,17 @@ int main(void)
 {
     /* ─── 1. 初始化（串口、定时器）─────────────────── */
     System_Init();
-    delay_ms(1000);   /* 等小车启动稳定（启动到 ready 大约 500ms~1s）*/
+
+    /*
+     * 上电安全握手：
+     *   1) 立刻发一次零速度，先尽力停车；
+     *   2) DCar 由整车供电，等待其真正启动稳定后再发一次零速度；
+     *   3) 这段时间所有 A=0x6F 运动回传都隔离，不允许污染首个业务任务。
+     */
+    DFCom_MoveSessionQuarantine();
+    Cmd_Move_Vel(0, 0, 0);
+    delay_ms(1000);   /* DCar 从整车取电，启动到 ready 大约需要 500ms~1s */
+    Cmd_Move_Vel(0, 0, 0);
 
     /* ===========================================================
      * ★★ 单位切换 (一行就能改, 想用什么单位取消注释那一行就行) ★★
@@ -329,6 +338,12 @@ int main(void)
     /* ★ 如果已经确认接线 + 激活都 OK, 可以把下面这行注释掉, 启动更快 */
     Startup_Diagnose();
 
+    /* 即使用户关闭 Startup_Diagnose，也给第二次停车的旧终止帧留出隔离窗口。 */
+    delay_ms(50);
+    /* 诊断期旧回传已经隔离；从两个全零槽开始接收正式运动任务。 */
+    DFCom_MoveSessionStart();
+    printf("[INIT] Motion session ready (A/B slots cleared)\r\n");
+
     /* ★★★ ODOM 自动打印位置说明 ★★★
      * --------------------------------------------------------------
      *  TIM2 在 System_Init() 里被初始化, 之后每 100ms (10Hz) 进入
@@ -347,13 +362,11 @@ int main(void)
     while (1)
     {
         /* ────────────────────────────────────────────
-         * 示例：走一个 50cm × 50cm 的方块（ROS 坐标系 +X 前 +Y 左）
-         *
-         *   起点 (0, 0)
-         *      ↑ 步骤 1: +X 前进 50cm  → 到 (50, 0)
-         *      ← 步骤 2: +Y 左移 50cm  → 到 (50, 50)
-         *      ↓ 步骤 3: -X 后退 50cm  → 到 (0, 50)
-         *      → 步骤 4: -Y 右移 50cm  → 回到 (0, 0)
+         * 当前回归序列：
+         *   1) +X 直线最多 1s
+         *   2) -X 直线最多 1s（同类型连续指令，专门验证旧 FF 隔离）
+         *   3) 左转 15°，最多 1s
+         *   4) 右转 15°，最多 1s（再次验证同类型连续指令）
          *
          * 入门玩法：注释掉 WaitMoveDone，加 delay_ms(3000)
          * 进阶玩法：用 WaitMoveDone 等小车真到位（当前就是）
@@ -362,11 +375,11 @@ int main(void)
          * 想改 SI 模式：System_Init 里打开 g_dfcom_unit_mode = DFCOM_UNIT_M
          *               然后把下面数值改成 0.5f / 0.3f 等
          *
-         * ★ WaitMoveDone 第二参为啥都填 0 ?
-         *   0 = "永久等待", 不设超时, 一直等到 MCU 真正回完成回传
-         *   这是最安全的写法, 杜绝 "雪崩吃单" bug (一秒疯发 3~5 条, 每条没动)
-         *   绝对不要随便填一个小数字 (e.g. 5000), 万一比小车实际跑这段
-         *   所需的物理时间还短, 会触发雪崩。详见 DFCom_Rx.c::WaitMoveDone 注释。
+         * ★ WaitMoveDone 第二参是任务允许执行的最长时间
+         *   1000 = 最多执行 1 秒；1 秒内提前完成就立即进入下一条，
+         *   1 秒仍未完成就返回 TIMEOUT，下一条运动命令会合法打断它。
+         *   0 才表示永久等待。A/B 交替槽会吞掉上一任务随后到达的终止帧，
+         *   不会把旧任务的 FF 错认成新任务完成。
          *
          * ★ WaitMoveDone 第一参 = CMD_xx, 必须跟刚发的指令对应!
          *   Cmd_Move_Linear         → CMD_LINEAR           (0x64)
@@ -381,8 +394,8 @@ int main(void)
          */
         Cmd_Move_Linear( 50,   0,  30, 2);  WaitMoveDone(CMD_LINEAR, 1000);  /* +X 前进 50cm, Profile 2 */
         Cmd_Move_Linear(-50,   0,  30, 2);  WaitMoveDone(CMD_LINEAR, 1000);  /* -X 后退 50cm */
-        Cmd_Move_Rot( 15, 60);  WaitMoveDone(CMD_ROT, 0);/* 原地左转 15°（CCW 逆时针，60 deg/s）*/
-        Cmd_Move_Rot( -15, 60);  WaitMoveDone(CMD_ROT, 0);/* 原地右转 15°（CCW 顺时针，60 deg/s）*/
+        Cmd_Move_Rot( 15, 60);  WaitMoveDone(CMD_ROT, 1000);/* 原地左转 15°（CCW 逆时针，60 deg/s）*/
+        Cmd_Move_Rot( -15, 60);  WaitMoveDone(CMD_ROT, 1000);/* 原地右转 15°（CW 顺时针，60 deg/s）*/
 
         /* 想画整圆？取消注释下面这行（半径 30cm, 圆心角 360°, 20 cm/s, 加减速）：*/
         // Cmd_Move_Arc(30, 360, 20, 1);  WaitMoveDone(CMD_ARC, 0);

@@ -20,7 +20,7 @@ void setup()
     dbg.begin(9600);
     dbg.println(F("== DcarON Arduino DFCom =="));
 
-    DFCom.begin(115200);        // 连小车 (硬件串口 D0/D1 @ 115200)
+    DFCom.begin(115200);        // 连小车，并先停车/清理旧运动会话
     DFCom.setDebug(dbg);
     DFCom.subscribeOdom(10);    // 订阅里程计 10Hz (≤50Hz)
 
@@ -38,9 +38,9 @@ void loop()
     /* 走一个边长 50cm 的方块 (前进 + 左转 90°, 四次) */
     for (uint8_t i = 0; i < 4; i++) {
         DFCom.moveLinear(50, 0, 30, 2); // 前进 50cm, 30cm/s, Profile 2
-        DFCom.waitDone();              // 等真到位 (内部自动收里程计)
+        DFCom.waitDone(10000);         // 到位即返回，10s 为链路兜底
         DFCom.moveRot(90);             // 原地左转 90°
-        DFCom.waitDone();
+        DFCom.waitDone(10000);
     }
 
     /* 一圈走完, 打印里程计 (注意: 打印放在 waitDone 之外, 不干扰收帧) */

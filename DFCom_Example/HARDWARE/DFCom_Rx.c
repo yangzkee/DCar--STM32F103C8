@@ -51,8 +51,18 @@
  * ===========================================================================*/
 volatile OdomData_t   g_odom         = {0};   /* Odom v4 (CMD 0x6C 0x80, 51B) */
 volatile VelPosData_t g_velpos       = {0};   /* VelPos v2 (CMD 0x6C 0x81, 35B) */
-volatile MoveStatus_t g_move_status[8] = {{0}};
+volatile MoveStatus_t g_move_status[2] = {{0}};
 volatile DcarState_t  g_dcar_state   = {0};
+
+#define MOVE_SLOT_NONE  0xFF
+
+/* 运动任务只保留“当前槽 + 旧槽丢弃器”这两个角色。 */
+static volatile u8 g_move_current_slot    = MOVE_SLOT_NONE;
+static volatile u8 g_move_discard_slot    = MOVE_SLOT_NONE;
+static volatile u8 g_move_discard_cmd     = 0;
+static volatile u8 g_move_session_active  = 0;
+static volatile u8 g_move_send_failed     = 0;
+static volatile u8 g_move_failed_cmd      = 0;
 
 /* 本地 ms tick（由 TIM2 中断 +1，在 DFCom_Print.c 维护） */
 extern volatile u32 g_local_tick_ms;
@@ -70,6 +80,169 @@ static s32 read_s32(const u8 *p) {
 
 static u32 read_u32(const u8 *p) {
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static u8 move_is_bounded_cmd(u8 cmd_code)
+{
+    return (cmd_code >= CMD_ROT && cmd_code <= CMD_ARC);
+}
+
+static void move_clear_slot(u8 slot)
+{
+    if (slot > 1) return;
+    g_move_status[slot].cmd_code    = 0;
+    g_move_status[slot].progress    = 0;
+    g_move_status[slot].last_notice = 0;
+    g_move_status[slot].fresh       = 0;
+}
+
+static u8 move_slot_is_terminal(u8 slot)
+{
+    return (slot <= 1 &&
+            g_move_status[slot].fresh &&
+            g_move_status[slot].progress == 0xFF);
+}
+
+static void move_release_discard(void)
+{
+    if (g_move_discard_slot <= 1) {
+        move_clear_slot(g_move_discard_slot);
+    }
+    g_move_discard_slot = MOVE_SLOT_NONE;
+    g_move_discard_cmd  = 0;
+}
+
+/*
+ * 当前任务离开前台时，已终止的槽直接清空；未终止的槽变成丢弃器，
+ * 专门吞掉该任务随后唯一的终止帧。
+ */
+static void move_retire_current(void)
+{
+    u8 slot = g_move_current_slot;
+    u8 cmd_code;
+
+    if (slot > 1) return;
+    cmd_code = g_move_status[slot].cmd_code;
+
+    if (move_slot_is_terminal(slot)) {
+        move_clear_slot(slot);
+    } else {
+        if (g_move_discard_slot <= 1 &&
+            g_move_discard_slot != slot) {
+            move_release_discard();
+        }
+        move_clear_slot(slot);
+        g_move_discard_slot = slot;
+        g_move_discard_cmd  = cmd_code;
+    }
+    g_move_current_slot = MOVE_SLOT_NONE;
+}
+
+static u8 move_next_slot(void)
+{
+    if (g_move_current_slot <= 1) return g_move_current_slot ^ 1U;
+    if (g_move_discard_slot <= 1) return g_move_discard_slot ^ 1U;
+    return 0;
+}
+
+static u32 move_enter_critical(void)
+{
+    u32 primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+}
+
+static void move_exit_critical(u32 primask)
+{
+    if ((primask & 1U) == 0) __enable_irq();
+}
+
+static void move_reset_session_state(u8 active)
+{
+    move_clear_slot(0);
+    move_clear_slot(1);
+    g_move_current_slot   = MOVE_SLOT_NONE;
+    g_move_discard_slot   = MOVE_SLOT_NONE;
+    g_move_discard_cmd    = 0;
+    g_move_send_failed    = 0;
+    g_move_failed_cmd     = 0;
+    g_move_session_active = active;
+}
+
+void DFCom_MoveSessionQuarantine(void)
+{
+    u32 primask = move_enter_critical();
+    move_reset_session_state(0);
+    move_exit_critical(primask);
+}
+
+void DFCom_MoveSessionStart(void)
+{
+    u32 primask = move_enter_critical();
+    move_reset_session_state(1);
+    move_exit_critical(primask);
+}
+
+/*
+ * 只能在运动帧成功启动 DMA 后调用。
+ * 有界任务按 A/B/A/B 交替；若目标槽还是 N-2 的旧丢弃槽，直接强制清空复用，
+ * 因此丢过一次终止帧也不会让槽永久占用。
+ */
+void DFCom_MoveCommandSent(u8 cmd_code)
+{
+    u32 primask;
+    u8 next;
+
+    if (cmd_code != CMD_VEL && !move_is_bounded_cmd(cmd_code)) return;
+
+    primask = move_enter_critical();
+    g_move_send_failed = 0;
+    g_move_failed_cmd  = 0;
+
+    /* 上电停车/诊断阶段仍发送帧，但所有运动回传都处于隔离态。 */
+    if (!g_move_session_active) {
+        move_exit_critical(primask);
+        return;
+    }
+
+    /*
+     * 持续速度没有可等待的自然终止帧，但它会打断当前有界任务。
+     * 所以只把旧当前槽降级为丢弃器，不为 CMD_VEL 建立新当前槽。
+     */
+    if (cmd_code == CMD_VEL) {
+        move_retire_current();
+        move_exit_critical(primask);
+        return;
+    }
+
+    next = move_next_slot();
+
+    /*
+     * A→B→A：轮到一个槽再次成为当前槽时，无条件放弃它保存的 N-2 旧任务。
+     * 这是“终止帧在客户端丢失”时的硬兜底，不让旧槽永久等待。
+     */
+    if (g_move_discard_slot == next) {
+        move_release_discard();
+    }
+
+    move_retire_current();
+    move_clear_slot(next);
+    g_move_status[next].cmd_code = cmd_code;
+    g_move_current_slot = next;
+    move_exit_critical(primask);
+}
+
+void DFCom_MoveCommandSendFailed(u8 cmd_code)
+{
+    u32 primask;
+    if (!move_is_bounded_cmd(cmd_code)) return;
+
+    primask = move_enter_critical();
+    if (g_move_session_active) {
+        g_move_send_failed = 1;
+        g_move_failed_cmd  = cmd_code;
+    }
+    move_exit_critical(primask);
 }
 
 
@@ -226,18 +399,34 @@ static void parse_velpos_v2(const u8 *payload, u8 payload_len)
  *    0x65 = CMD_LINEAR_WITH_YAW (无头位移)
  *    0x66 = CMD_ARC          (圆弧)
  *
- *  应用层用 WaitMoveDone(cmd) 等到 g_move_status[idx].progress == 0xFF
- *
- *  g_move_status 用 (cmd & 0x07) 索引: 0x62..0x66 → 2..6, 都不冲突。
+ *  A/B 两槽绑定的是“本地发送次序”，不是命令类型。旧槽只吞帧，不保存状态；
+ *  当前槽才会写入进度。这样连续两条相同 B 的指令也不会共用状态槽。
  *============================================================================*/
 static void parse_move_progress(u8 cmd_code, const u8 *payload, u8 payload_len)
 {
-    u8 idx;
     if (payload_len < 2) return;
-    idx = cmd_code & 0x07;
-    g_move_status[idx].progress    = payload[0];
-    g_move_status[idx].last_notice = payload[1];
-    g_move_status[idx].fresh       = 1;
+    if (!g_move_session_active) return;
+    if (!move_is_bounded_cmd(cmd_code)) return;
+
+    /*
+     * 同类型连续指令时，DCar 回传里没有本地槽号。按协议顺序，上一任务会先
+     * 回唯一的 0xFF 终止帧；旧槽在此之前吞掉同 B 的全部帧，见到 0xFF 后释放。
+     * 若这唯一终止帧真的在客户端丢失，无法证明身份的同 B 帧仍按旧帧丢弃：
+     * 最坏结果是当前 Wait 等满上限，而不是错误提前完成并跳过动作。
+     */
+    if (g_move_discard_slot <= 1 && cmd_code == g_move_discard_cmd) {
+        if (payload[0] == 0xFF) {
+            move_release_discard();
+        }
+        return;
+    }
+
+    if (g_move_current_slot <= 1 &&
+        g_move_status[g_move_current_slot].cmd_code == cmd_code) {
+        g_move_status[g_move_current_slot].progress    = payload[0];
+        g_move_status[g_move_current_slot].last_notice = payload[1];
+        g_move_status[g_move_current_slot].fresh       = 1;
+    }
 }
 
 
@@ -377,89 +566,94 @@ void DFCom_RxParse(u8 *data, u16 size)
  *  -----------------------------    ---------------------------------
  *  Cmd_Move_Linear(...)         →  CMD_LINEAR           (0x64)
  *  Cmd_Move_LinearWithYaw(...)  →  CMD_LINEAR_WITH_YAW  (0x65)
- *  Cmd_Move_Rotate(...)         →  CMD_ROT              (0x63)
+ *  Cmd_Move_Rot(...)            →  CMD_ROT              (0x63)
  *  Cmd_Move_Arc(...)            →  CMD_ARC              (0x66)
- *  Cmd_Move_Velocity(...)       →  ★ 不要用 WaitMoveDone ★
+ *  Cmd_Move_Vel(...)            →  ★ 不要用 WaitMoveDone ★
  *                                  (持续速度没有完成回传, 等不到)
  *
- *  填错就等错槽位 (g_move_status[] 是按 cmd&0x07 索引的), 永远等不到
- *  → 主程序会卡死在这一行。
+ *  填错不会去读别的任务槽，而是立即返回 MOVE_WAIT_TIMEOUT。
  *
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 第二个参数 (timeout_ms) ★
  *
- *  timeout_ms == 0  → ★★★ 永久等待 (推荐!) ★★★
- *                     不设超时, 一直等到 MCU 真正回传 0xFF/0x00 (自然完成)
- *                     这是最安全的用法, 杜绝 "雪崩吃单" bug
- *                     代价: 万一小车失联/卡死, 这一行也卡死, 不会自己往下走
+ *  timeout_ms == 0  → 永久等待；链路失联时也不会自行返回。
  *
- *  timeout_ms > 0   → 设了超时
- *                     ⚠️ 注意: 超时时间必须 > 小车实际跑这段的物理时间!
- *                     ⚠️ 例如 0.5m @ 0.3m/s 梯形加减速 ≈ 5.5 秒, 超时设 5000ms
- *                        就会刚好踩在临界, 触发 "雪崩":
- *                          客户端超时 return 0 → 立刻发下一条 →
- *                          MCU 端 Motion_* 被新指令打断, 立刻回 0xFF/0x64 →
- *                          下一次 WaitMoveDone 入口清零和打断回传时序竞争 →
- *                          客户端被骗 "完成", 又发下一条 →
- *                          雪崩, 每条只跑几毫秒就被打断, 一秒疯发 3~5 条!
- *                     ⚠️ 安全的超时值: 物理时间 × 2~3 倍, 留足余量。
- *                        或者干脆传 0, 别用超时。
+ *  timeout_ms > 0   → 这条任务允许执行的【最长时间】。
+ *                     若 DCar 提前完成，收到本任务 FF/00 后立即返回 DONE；
+ *                     到达时限仍未完成，立即返回 TIMEOUT。调用者随后发送的
+ *                     下一条运动命令会按协议合法打断上一条。
+ *
+ *  A/B 槽如何防止旧终止帧误伤下一条：
+ *    - 相邻任务强制使用不同槽；
+ *    - 超时任务的槽降级为“旧槽丢弃器”，只吞帧，不保存状态；
+ *    - 旧任务唯一的 0xFF 终止帧只负责释放旧槽，不会完成新任务；
+ *    - 到 N+2 轮回时无条件清空复用，即使客户端丢过旧终止帧也不永久占槽。
  *
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 返回值 ★
  *
  *  返回 MOVE_WAIT_DONE        → 自然完成 (progress=0xFF + notice=0x00)
- *  返回 MOVE_WAIT_TIMEOUT     → 超时 (timeout_ms>0 时才会发生)
+ *  返回 MOVE_WAIT_TIMEOUT     → 超时、发送失败或未绑定到最近任务
  *  返回 MOVE_WAIT_INTERRUPTED → 被打断 (progress=0xFF + notice!=0x00)
  *
- *  ⚠️ 重要: 这一版修过了 "被打断也算完成" 的 bug
- *  从前 progress=0xFF 就直接 return 1, 但 0xFF 有两个含义:
+ *  progress=0xFF 只是“任务终止”，notice 才决定结果：
  *    last_notice=0x00 → 自然完成 (车真的到位了)
  *    last_notice=0x01 → 任务被拒绝 (版本不支持或参数非法)
  *    last_notice=0x0A → 被遥控器接管
  *    last_notice=0x62~0x66 → 被对应的新运动指令打断
- *  老代码不区分, 把 "被打断" 当 "完成", 直接造成雪崩。
- *  现在自然完成返回 MOVE_WAIT_DONE, 被打断返回 MOVE_WAIT_INTERRUPTED。
  *
  *  ──────────────────────────────────────────────────────────────────────────
  *  ★ 用法示例 ★
  *
- *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);    // SI 模式: 前进 0.5m, 速度 0.3m/s
- *    WaitMoveDone(CMD_LINEAR, 0);       // 永久等, 推荐
- *
- *    Cmd_Move_Arc(0.3f, 1.5708f, 0.2f); // 半径 0.3m, +90°, 0.2m/s
- *    WaitMoveDone(CMD_ARC, 0);          // 永久等
- *
- *    Cmd_Move_Rotate(3.14159f, 1.0f);   // 转 180°, 角速度 1 rad/s
- *    WaitMoveDone(CMD_ROT, 0);
- *
- *  示例 (带超时, 必须保守):
- *    Cmd_Move_Linear(0.5f, 0, 0.3f, 2);
- *    if (WaitMoveDone(CMD_LINEAR, 15000) == 0) {     // 15s 兜底
- *        printf("timeout, sending stop\r\n");
- *        Cmd_Move_Velocity(0, 0, 0);                  // 主动停车
- *        delay_ms(1000);                              // 让 MCU 喘口气
- *    }
+ *    Cmd_Move_Linear(50, 0, 30, 2);       // CM 模式：前进 50cm
+ *    WaitMoveDone(CMD_LINEAR, 1000);       // 最多跑 1s；提前完成就提前返回
+ *    Cmd_Move_Linear(-50, 0, 30, 2);      // 到点后打断上一条，或自然接续
+ *    WaitMoveDone(CMD_LINEAR, 1000);
  *============================================================================*/
 u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
 {
-    u8 idx = cmd_code & 0x07;
+    u8 slot;
     u8 notice;
+    u8 send_failed;
+    u32 primask;
     u32 start;
-    /* Cmd_Move_* 已在发送前清槽。这里不能再清，否则会抹掉已经快速返回的终止帧。 */
+
+    /*
+     * 发送成功时已经完成切槽。这里只拍下当前槽，不清任何状态；
+     * 因而零距离/参数拒绝等“比 Wait 入口更快”的终止帧也不会被抹掉。
+     */
+    primask = move_enter_critical();
+    send_failed = (g_move_send_failed && g_move_failed_cmd == cmd_code);
+    if (g_move_current_slot <= 1 &&
+        g_move_status[g_move_current_slot].cmd_code == cmd_code) {
+        slot = g_move_current_slot;
+    } else {
+        slot = MOVE_SLOT_NONE;
+    }
+    move_exit_critical(primask);
 
     start = g_local_tick_ms;
-    /* ★★★ 诊断 printf (2026-05-26 加, 定位 "1 秒超时不退出" 问题) ★★★
-     * 跑一次抓 USART2 log, 看 IN / DONE / INTERRUPTED / TIMEOUT 能不能配对。
-     * 验证完根因后这三行可以删掉。 */
-    printf("[WAIT.IN]  cmd=0x%02X tmo=%lu start_tick=%lu\r\n",
-           (unsigned)cmd_code, (unsigned long)timeout_ms, (unsigned long)start);
+    printf("[WAIT.IN]  cmd=0x%02X slot=%u tmo=%lu start_tick=%lu\r\n",
+           (unsigned)cmd_code, (unsigned)slot,
+           (unsigned long)timeout_ms, (unsigned long)start);
+
+    if (send_failed) {
+        printf("[WAIT.TX_FAIL] cmd=0x%02X (DMA frame was not started)\r\n",
+               (unsigned)cmd_code);
+        return MOVE_WAIT_TIMEOUT;
+    }
+
+    if (slot == MOVE_SLOT_NONE) {
+        printf("[WAIT.NO_TASK] cmd=0x%02X (not the latest bounded command)\r\n",
+               (unsigned)cmd_code);
+        return MOVE_WAIT_TIMEOUT;
+    }
 
     while (1) {
         /* 终止帧统一由 progress=0xFF 标识，notice 决定自然完成或被打断。 */
-        if (g_move_status[idx].fresh &&
-            g_move_status[idx].progress == 0xFF) {
-            notice = g_move_status[idx].last_notice;
+        if (g_move_status[slot].fresh &&
+            g_move_status[slot].progress == 0xFF) {
+            notice = g_move_status[slot].last_notice;
             if (notice == MOVE_NOTICE_NONE) {
                 printf("[WAIT.DONE] cmd=0x%02X waited=%lums\r\n",
                        (unsigned)cmd_code,
@@ -474,7 +668,7 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
             return MOVE_WAIT_INTERRUPTED;
         }
         if (timeout_ms != 0) {                /* timeout_ms == 0 ⇒ 永久等待 */
-            if ((g_local_tick_ms - start) > timeout_ms) {
+            if ((g_local_tick_ms - start) >= timeout_ms) {
                 printf("[WAIT.TIMEOUT] cmd=0x%02X waited=%lums now_tick=%lu (没等到 progress=FF)\r\n",
                        (unsigned)cmd_code,
                        (unsigned long)(g_local_tick_ms - start),
@@ -506,12 +700,18 @@ u8 WaitMoveDone(u8 cmd_code, u32 timeout_ms)
 
 u8 GetMoveProgress(u8 cmd_code)
 {
-    u8 idx = cmd_code & 0x07;
-    return g_move_status[idx].progress;
+    u8 slot = g_move_current_slot;
+    if (slot <= 1 && g_move_status[slot].cmd_code == cmd_code) {
+        return g_move_status[slot].progress;
+    }
+    return 0;
 }
 
 u8 GetMoveNotice(u8 cmd_code)
 {
-    u8 idx = cmd_code & 0x07;
-    return g_move_status[idx].last_notice;
+    u8 slot = g_move_current_slot;
+    if (slot <= 1 && g_move_status[slot].cmd_code == cmd_code) {
+        return g_move_status[slot].last_notice;
+    }
+    return 0;
 }

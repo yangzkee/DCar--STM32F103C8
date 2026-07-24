@@ -9,6 +9,7 @@ static const uint8_t DF_HEAD = 0xDF;
 static const uint8_t DF_TAIL = 0xFD;
 static const uint8_t DF_ROBOT_ID = 0x01;   /* 小车 ID */
 static const uint8_t DF_PC_ID    = 0x97;   /* 上位机 (本 Arduino) */
+static const uint8_t MOVE_SLOT_NONE = 0xFF;
 
 /* ---- 回传 scale 表 (与小车端一致) ---- */
 #define SC_ANGLE 10000.0f
@@ -35,7 +36,19 @@ void DFCom_t::begin(long baud, HardwareSerial &port)
     _ser = &port;
     _ser->begin(baud);
     _idx = 0; _st = 0; _need = 0;
-    for (uint8_t i = 0; i < 8; i++) { _mvProg[i]=0; _mvNotice[i]=0; _mvFresh[i]=0; }
+
+    /*
+     * Arduino 可能在 DCar 已经执行旧任务时复位。先隔离回传并连续停车两次：
+     * 第一帧尽快止车，第二帧跨过 DCar 供电/串口稳定期后再次确认。
+     */
+    _resetMotionSession(0);
+    moveVel(0, 0, 0);
+    delay(1000);
+    moveVel(0, 0, 0);
+    delay(50);
+    update();
+    _idx = 0; _st = 0; _need = 0;
+    _resetMotionSession(1);
 }
 
 /* ---- 单位转换 (按当前模式把入参折算成 SI) ---- */
@@ -56,7 +69,7 @@ float DFCom_t::_toRad(float v)
  *   [0xDF][ROBOT_ID][PC_ID][A][B][LEN][payload..][0xFD][csum_lo][csum_hi]
  *   校验和 = [0] 累加到 [0xFD] (含), u16 LE
  * ===========================================================================*/
-void DFCom_t::_frame(uint8_t A, uint8_t B, const uint8_t *payload, uint8_t len)
+bool DFCom_t::_frame(uint8_t A, uint8_t B, const uint8_t *payload, uint8_t len)
 {
     uint8_t f[72];
     uint8_t n = 0;
@@ -73,13 +86,113 @@ void DFCom_t::_frame(uint8_t A, uint8_t B, const uint8_t *payload, uint8_t len)
     for (uint8_t i = 0; i < sum_len; i++) sc += f[i];
     f[n++] = (uint8_t)(sc & 0xFF);
     f[n++] = (uint8_t)((sc >> 8) & 0xFF);
-    _ser->write(f, n);
+    return _ser->write(f, n) == n;
 }
 
-void DFCom_t::_clearSlot(uint8_t cmd)
+bool DFCom_t::_isBoundedMotion(uint8_t cmd)
 {
-    uint8_t i = cmd & 0x07;
-    _mvProg[i] = 0; _mvNotice[i] = 0; _mvFresh[i] = 0;
+    return cmd >= DFCOM_CMD_ROT && cmd <= DFCOM_CMD_ARC;
+}
+
+void DFCom_t::_clearMoveSlot(uint8_t slot)
+{
+    if (slot > 1) return;
+    _moveSlots[slot].cmd = 0;
+    _moveSlots[slot].progress = 0;
+    _moveSlots[slot].notice = 0;
+    _moveSlots[slot].fresh = 0;
+}
+
+void DFCom_t::_releaseDiscard()
+{
+    if (_discardSlot <= 1) _clearMoveSlot(_discardSlot);
+    _discardSlot = MOVE_SLOT_NONE;
+    _discardCmd = 0;
+}
+
+void DFCom_t::_retireCurrent()
+{
+    uint8_t slot = _currentSlot;
+    if (slot > 1) return;
+
+    uint8_t cmd = _moveSlots[slot].cmd;
+    bool terminal = _moveSlots[slot].fresh &&
+                    _moveSlots[slot].progress == 0xFF;
+
+    if (terminal) {
+        _clearMoveSlot(slot);
+    } else {
+        if (_discardSlot <= 1 && _discardSlot != slot) _releaseDiscard();
+        _clearMoveSlot(slot);
+        _discardSlot = slot;
+        _discardCmd = cmd;
+    }
+    _currentSlot = MOVE_SLOT_NONE;
+}
+
+uint8_t DFCom_t::_nextMoveSlot() const
+{
+    if (_currentSlot <= 1) return _currentSlot ^ 1U;
+    if (_discardSlot <= 1) return _discardSlot ^ 1U;
+    return 0;
+}
+
+void DFCom_t::_resetMotionSession(uint8_t active)
+{
+    _clearMoveSlot(0);
+    _clearMoveSlot(1);
+    _currentSlot = MOVE_SLOT_NONE;
+    _discardSlot = MOVE_SLOT_NONE;
+    _discardCmd = 0;
+    _sendFailed = 0;
+    _failedCmd = 0;
+    _motionSessionActive = active;
+}
+
+void DFCom_t::_motionSent(uint8_t cmd)
+{
+    if (cmd != DFCOM_CMD_VEL && !_isBoundedMotion(cmd)) return;
+
+    _sendFailed = 0;
+    _failedCmd = 0;
+    if (!_motionSessionActive) return;
+
+    if (cmd == DFCOM_CMD_VEL) {
+        _retireCurrent();
+        return;
+    }
+
+    uint8_t next = _nextMoveSlot();
+    if (_discardSlot == next) _releaseDiscard();
+    _retireCurrent();
+    _clearMoveSlot(next);
+    _moveSlots[next].cmd = cmd;
+    _currentSlot = next;
+}
+
+void DFCom_t::_motionSendFailed(uint8_t cmd)
+{
+    if (_motionSessionActive && _isBoundedMotion(cmd)) {
+        _sendFailed = 1;
+        _failedCmd = cmd;
+    }
+}
+
+void DFCom_t::_routeMotionProgress(uint8_t cmd, uint8_t progressValue,
+                                   uint8_t noticeValue)
+{
+    if (!_motionSessionActive || !_isBoundedMotion(cmd)) return;
+
+    if (_discardSlot <= 1 && cmd == _discardCmd) {
+        if (progressValue == 0xFF) _releaseDiscard();
+        return;
+    }
+
+    if (_currentSlot <= 1 && _moveSlots[_currentSlot].cmd == cmd) {
+        _moveSlots[_currentSlot].progress = progressValue;
+        _moveSlots[_currentSlot].notice = noticeValue;
+        _moveSlots[_currentSlot].fresh = 1;
+    }
 }
 
 /* ===========================================================================
@@ -88,22 +201,32 @@ void DFCom_t::_clearSlot(uint8_t cmd)
 void DFCom_t::moveLinear(float px, float py, float speed, uint8_t profile)
 {
     px = _toM(px); py = _toM(py); speed = _toM(speed);
-    if (speed <= 0.0f) return;
+    _lastCmd = DFCOM_CMD_LINEAR;
+    if (speed <= 0.0f) {
+        _motionSendFailed(DFCOM_CMD_LINEAR);
+        return;
+    }
     if (profile > 2) profile = 2;
     uint8_t p[13];
     put_s32(&p[0], (int32_t)(px * SC_SI));
     put_s32(&p[4], (int32_t)(py * SC_SI));
     put_s32(&p[8], (int32_t)(speed * SC_SI));
     p[12] = profile;
-    _clearSlot(DFCOM_CMD_LINEAR);
-    _lastCmd = DFCOM_CMD_LINEAR;
-    _frame(0x02, DFCOM_CMD_LINEAR, p, 13);
+    if (_frame(0x02, DFCOM_CMD_LINEAR, p, 13)) {
+        _motionSent(DFCOM_CMD_LINEAR);
+    } else {
+        _motionSendFailed(DFCOM_CMD_LINEAR);
+    }
 }
 
 void DFCom_t::moveLinearWithYaw(float px, float py, float dyaw, float speed, uint8_t profile)
 {
     px = _toM(px); py = _toM(py); dyaw = _toRad(dyaw); speed = _toM(speed);
-    if (speed <= 0.0f) return;
+    _lastCmd = DFCOM_CMD_LWY;
+    if (speed <= 0.0f) {
+        _motionSendFailed(DFCOM_CMD_LWY);
+        return;
+    }
     if (profile > 2) profile = 2;
     uint8_t p[17];
     put_s32(&p[0],  (int32_t)(px * SC_SI));
@@ -111,21 +234,29 @@ void DFCom_t::moveLinearWithYaw(float px, float py, float dyaw, float speed, uin
     put_s32(&p[8],  (int32_t)(dyaw * SC_SI));
     put_s32(&p[12], (int32_t)(speed * SC_SI));
     p[16] = profile;
-    _clearSlot(DFCOM_CMD_LWY);
-    _lastCmd = DFCOM_CMD_LWY;
-    _frame(0x02, DFCOM_CMD_LWY, p, 17);
+    if (_frame(0x02, DFCOM_CMD_LWY, p, 17)) {
+        _motionSent(DFCOM_CMD_LWY);
+    } else {
+        _motionSendFailed(DFCOM_CMD_LWY);
+    }
 }
 
 void DFCom_t::moveRot(float dyaw, float omegaMax)
 {
     dyaw = _toRad(dyaw); omegaMax = _toRad(omegaMax);
-    if (omegaMax <= 0.0f) return;
+    _lastCmd = DFCOM_CMD_ROT;
+    if (omegaMax <= 0.0f) {
+        _motionSendFailed(DFCOM_CMD_ROT);
+        return;
+    }
     uint8_t p[8];
     put_s32(&p[0], (int32_t)(dyaw * SC_SI));
     put_s32(&p[4], (int32_t)(omegaMax * SC_SI));
-    _clearSlot(DFCOM_CMD_ROT);
-    _lastCmd = DFCOM_CMD_ROT;
-    _frame(0x02, DFCOM_CMD_ROT, p, 8);
+    if (_frame(0x02, DFCOM_CMD_ROT, p, 8)) {
+        _motionSent(DFCOM_CMD_ROT);
+    } else {
+        _motionSendFailed(DFCOM_CMD_ROT);
+    }
 }
 
 void DFCom_t::moveVel(float vx, float vy, float vz)
@@ -136,28 +267,36 @@ void DFCom_t::moveVel(float vx, float vy, float vz)
     put_s32(&p[4], (int32_t)(vy * SC_SI));
     put_s32(&p[8], (int32_t)(vz * SC_SI));
     /* 持续速度无完成回传, 不动 _lastCmd / 不清槽 */
-    _frame(0x02, DFCOM_CMD_VEL, p, 12);
+    if (_frame(0x02, DFCOM_CMD_VEL, p, 12)) {
+        _motionSent(DFCOM_CMD_VEL);
+    }
 }
 
 void DFCom_t::moveArc(float radius, float dyaw, float speed, uint8_t profile)
 {
     radius = _toM(radius); dyaw = _toRad(dyaw); speed = _toM(speed);
-    if (speed <= 0.0f) return;
+    _lastCmd = DFCOM_CMD_ARC;
+    if (speed <= 0.0f) {
+        _motionSendFailed(DFCOM_CMD_ARC);
+        return;
+    }
     if (profile > 2) profile = 2;
     uint8_t p[13];
     put_s32(&p[0], (int32_t)(radius * SC_SI));
     put_s32(&p[4], (int32_t)(dyaw * SC_SI));
     put_s32(&p[8], (int32_t)(speed * SC_SI));
     p[12] = profile;
-    _clearSlot(DFCOM_CMD_ARC);
-    _lastCmd = DFCOM_CMD_ARC;
-    _frame(0x02, DFCOM_CMD_ARC, p, 13);
+    if (_frame(0x02, DFCOM_CMD_ARC, p, 13)) {
+        _motionSent(DFCOM_CMD_ARC);
+    } else {
+        _motionSendFailed(DFCOM_CMD_ARC);
+    }
 }
 
 /* ===========================================================================
  * 里程计订阅 (A=0x04 DataRecivViitClass, B=0x80/0x81) / 状态查询
  * ===========================================================================*/
-static uint8_t visit_freq_code(uint8_t freqHz)
+static uint8_t visit_freq_code(uint16_t freqHz)
 {
     if      (freqHz == 10)  return 1;
     else if (freqHz == 50)  return 5;
@@ -173,7 +312,7 @@ static uint8_t visit_type_code(uint8_t mode)
     return (mode == DFCOM_MODE_CONTINUOUS) ? 0x01 : 0x02;  /* STOP→ONESHOT */
 }
 
-void DFCom_t::subscribeOdom(uint8_t freqHz, uint8_t mode)
+void DFCom_t::subscribeOdom(uint16_t freqHz, uint8_t mode)
 {
     uint8_t fcode = visit_freq_code(freqHz);
     uint8_t vtype = visit_type_code(mode);
@@ -181,7 +320,7 @@ void DFCom_t::subscribeOdom(uint8_t freqHz, uint8_t mode)
     _frame(0x04, 0x80, p, 2);
 }
 
-void DFCom_t::subscribeVelPos(uint8_t freqHz, uint8_t mode)
+void DFCom_t::subscribeVelPos(uint16_t freqHz, uint8_t mode)
 {
     uint8_t fcode = visit_freq_code(freqHz);
     uint8_t vtype = visit_type_code(mode);
@@ -288,10 +427,7 @@ void DFCom_t::_dispatch(uint8_t A, uint8_t B, const uint8_t *p, uint8_t len)
     }
     else if (A == 0x6F && len >= 2) {
         /* 运动完成/进度回传, B = 原 cmd 码 */
-        uint8_t i = B & 0x07;
-        _mvProg[i]   = p[0];
-        _mvNotice[i] = p[1];
-        _mvFresh[i]  = 1;
+        _routeMotionProgress(B, p[0], p[1]);
     }
     else if (A == 0x8C && B == 0x40 && len >= 12) {
         /* 激活/校准状态 */
@@ -308,16 +444,33 @@ void DFCom_t::_dispatch(uint8_t A, uint8_t B, const uint8_t *p, uint8_t len)
 
 /* ===========================================================================
  * 等运动完成 (阻塞, 内部持续 update 收解析; millis 计时)
- *   只有 progress==0xFF 且 notice==0 才算"自然完成" (防被打断误判)
+ *   wait 只观察发送时已经绑定的当前槽，绝不在入口清状态。
  * ===========================================================================*/
 bool DFCom_t::waitDone(uint8_t cmdCode, uint32_t timeoutMs)
 {
-    uint8_t i = cmdCode & 0x07;
-    _mvProg[i] = 0; _mvNotice[i] = 0; _mvFresh[i] = 0;
+    bool sendFailed = _sendFailed && _failedCmd == cmdCode;
+    uint8_t slot = (_currentSlot <= 1 &&
+                    _moveSlots[_currentSlot].cmd == cmdCode)
+                       ? _currentSlot
+                       : MOVE_SLOT_NONE;
+
+    if (sendFailed || slot == MOVE_SLOT_NONE) return false;
+
     uint32_t start = millis();
     for (;;) {
         update();   /* 紧凑轮询, 及时清空硬件 RX 缓冲 (避免 64B 溢出) */
-        if (_mvFresh[i] && _mvProg[i] == 0xFF && _mvNotice[i] == 0x00) return true;
-        if (timeoutMs != 0 && (millis() - start) > timeoutMs) return false;
+        if (_moveSlots[slot].fresh &&
+            _moveSlots[slot].progress == 0xFF) {
+            return _moveSlots[slot].notice == 0x00;
+        }
+        if (timeoutMs != 0 && (millis() - start) >= timeoutMs) return false;
     }
+}
+
+uint8_t DFCom_t::progress(uint8_t cmdCode)
+{
+    if (_currentSlot <= 1 && _moveSlots[_currentSlot].cmd == cmdCode) {
+        return _moveSlots[_currentSlot].progress;
+    }
+    return 0;
 }

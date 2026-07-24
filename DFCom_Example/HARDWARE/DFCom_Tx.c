@@ -40,6 +40,10 @@
 #include "usart.h"
 #include "delay.h"
 
+/* Rx 内部的任务槽交接点，不属于应用层 API。 */
+void DFCom_MoveCommandSent(u8 cmd_code);
+void DFCom_MoveCommandSendFailed(u8 cmd_code);
+
 /* 字节拆分宏（标准库 BYTE0/1/2/3） */
 #define BYTE0(v) ((u8)((v) & 0xFF))
 #define BYTE1(v) ((u8)(((v) >> 8) & 0xFF))
@@ -105,35 +109,30 @@ static u8 finalize_frame(u8 *buf, u8 data_len)
     return cnt;
 }
 
-static void send_frame(u8 *buf, u8 len)
+static u8 send_frame(u8 *buf, u8 len)
 {
-    /* DMA 发送，最多重试 3 次（上一帧 DMA 还在跑时立刻发会失败） */
-    u8 retry = 0;
-    while (USART1_Send_By_DMA(buf, len) != 0 && retry < 3) {
-        retry++;
+    u8 retry;
+    /* DMA 发送，最多尝试 3 次；返回 1 表示本帧已经成功启动。 */
+    for (retry = 0; retry < 3; retry++) {
+        if (USART1_Send_By_DMA(buf, len) == 0) return 1;
         delay_us(200);
     }
+    return 0;
 }
 
-/*----------------------------------------------------------------------------
- * 发送 Motion 指令前清掉对应 cmd 在 g_move_status 里的残留状态
- * ---------------------------------------------------------------------------
- * 为什么要清:
- *   WaitMoveDone 通过 g_move_status[cmd & 0x07] 判断完成。
- *   如果上一条 Motion_* 被打断, MCU 会发 progress=0xFF / notice!=0 回传,
- *   这条回传会停留在 g_move_status 里。
- *   所以发送侧必须在发帧前清零。WaitMoveDone 只读状态，不再二次清零，
- *   避免版本拒绝/零距离等快速终止帧刚到就被等待函数抹掉。
- *
- * 只有有完成回传的命令需要清 (LINEAR / LINEAR_WITH_YAW / ROT / ARC)。
- * VEL (持续速度) 没有完成回传, 不需要清。
- *--------------------------------------------------------------------------*/
-static void clear_move_slot(u8 cmd_code)
+/*
+ * 运动槽只能在 DMA 成功启动之后切换：发送失败时，WaitMoveDone 会立即返回
+ * TIMEOUT，而不会错误绑定到上一条同类型任务。
+ */
+static void send_motion_frame(u8 *buf, u8 len, u8 cmd_code)
 {
-    u8 idx = cmd_code & 0x07;
-    g_move_status[idx].progress    = 0;
-    g_move_status[idx].last_notice = 0;
-    g_move_status[idx].fresh       = 0;
+    if (send_frame(buf, len)) {
+        DFCom_MoveCommandSent(cmd_code);
+    } else {
+        DFCom_MoveCommandSendFailed(cmd_code);
+        printf("[TX.FAIL] motion cmd=0x%02X DMA frame was not started\r\n",
+               (unsigned)cmd_code);
+    }
 }
 
 /* 把 4 个字节小端写入 buf[off..off+3]，给 s32 LE 用 (协议统一整数编码哲学) */
@@ -172,7 +171,7 @@ static void put_s32_le(u8 *buf, s32 v)
  *    Cmd_Move_Linear(0.5, 0,   0.3, 2) →  前进 0.5 m, 0.3 m/s
  *    Cmd_Move_Linear(0,   0.5, 0.3, 2) →  左移 0.5 m
  *
- *  完整帧布局（共 21 字节，注意协议层永远走 SI ×10000）：
+ *  完整帧布局（共 22 字节，注意协议层永远走 SI ×10000）：
  *
  *    偏移   字段       类型     缩放    含义
  *    ────   ────────   ──────  ──────  ───────────────────────────────────
@@ -181,12 +180,13 @@ static void put_s32_le(u8 *buf, s32 v)
  *    [2]    PC_ID    = 0x97
  *    [3]    A = 0x02
  *    [4]    B = 0x64
- *    [5]    LEN = 12
+ *    [5]    LEN = 13
  *    [6..9]   px       s32 LE   ×10000   px=0.5 m  → 5000 → 88 13 00 00
  *    [10..13] py       s32 LE   ×10000
  *    [14..17] speed    s32 LE   ×10000   speed=0.3 → 3000 → B8 0B 00 00
- *    [18]   0xFD
- *    [19..20] checksum u16 LE
+ *    [18]   profile  u8       0=匀速, 1=梯形, 2=高精度
+ *    [19]   0xFD
+ *    [20..21] checksum u16 LE
  *
  *  完成回传：A=0x6F, B=0x64, payload=[Process(0~0xFE 或 0xFF), Notice]
  *============================================================================*/
@@ -207,7 +207,10 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
         speed_mps *= 0.001f;
     }
 
-    if (speed_mps <= 0.0f) return;
+    if (speed_mps <= 0.0f) {
+        DFCom_MoveCommandSendFailed(CMD_LINEAR);
+        return;
+    }
     if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_LINEAR);
@@ -223,8 +226,7 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
     buf[cnt++] = profile;                     /* ★ byte[12] = Profile (0/1/2) */
 
     cnt = finalize_frame(buf, 13);
-    clear_move_slot(CMD_LINEAR);
-    send_frame(buf, cnt);
+    send_motion_frame(buf, cnt, CMD_LINEAR);
 }
 
 
@@ -254,12 +256,13 @@ void Cmd_Move_Linear(float px, float py, float speed_mps, u8 profile)
  *    Cmd_Move_LinearWithYaw(0.5, 0, 1.5708f, 0.3)
  *      → 前进 0.5 m 同时整车左转 π/2 rad, 0.3 m/s
  *
- *  完整帧布局（共 25 字节，协议层 SI ×10000）：
+ *  完整帧布局（共 26 字节，协议层 SI ×10000）：
  *    [6..9]    px        s32 LE  ×10000
  *    [10..13]  py        s32 LE  ×10000
  *    [14..17]  dyaw_rad  s32 LE  ×10000
  *    [18..21]  speed     s32 LE  ×10000
- *    LEN = 16
+ *    [22]      profile    u8
+ *    LEN = 17
  *
  *  完成回传：A=0x6F, B=0x65
  *============================================================================*/
@@ -282,7 +285,10 @@ void Cmd_Move_LinearWithYaw(float px, float py, float dyaw_rad, float speed_mps,
         speed_mps *= 0.001f;
     }
 
-    if (speed_mps <= 0.0f) return;
+    if (speed_mps <= 0.0f) {
+        DFCom_MoveCommandSendFailed(CMD_LINEAR_WITH_YAW);
+        return;
+    }
     if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_LINEAR_WITH_YAW);
@@ -300,8 +306,7 @@ void Cmd_Move_LinearWithYaw(float px, float py, float dyaw_rad, float speed_mps,
     buf[cnt++] = profile;                     /* ★ byte[16] = Profile */
 
     cnt = finalize_frame(buf, 17);
-    clear_move_slot(CMD_LINEAR_WITH_YAW);
-    send_frame(buf, cnt);
+    send_motion_frame(buf, cnt, CMD_LINEAR_WITH_YAW);
 }
 
 
@@ -355,7 +360,10 @@ void Cmd_Move_Rot(float dyaw_rad, float omega_max_rad_s)
         omega_max_rad_s *= 0.01745329f;
     }
 
-    if (omega_max_rad_s <= 0.0f) return;
+    if (omega_max_rad_s <= 0.0f) {
+        DFCom_MoveCommandSendFailed(CMD_ROT);
+        return;
+    }
 
     cnt = build_header(buf, 0x02, CMD_ROT);
 
@@ -367,8 +375,7 @@ void Cmd_Move_Rot(float dyaw_rad, float omega_max_rad_s)
     put_s32_le(&buf[cnt], iomega); cnt += 4;
 
     cnt = finalize_frame(buf, 8);
-    clear_move_slot(CMD_ROT);   /* 清残留, 防止 WaitMoveDone 误判完成 */
-    send_frame(buf, cnt);
+    send_motion_frame(buf, cnt, CMD_ROT);
 }
 
 
@@ -439,7 +446,7 @@ void Cmd_Move_Vel(float vx_mps, float vy_mps, float vz_rad_s)
     put_s32_le(&buf[cnt], ivz); cnt += 4;
 
     cnt = finalize_frame(buf, 12);
-    send_frame(buf, cnt);
+    send_motion_frame(buf, cnt, CMD_VEL);
 }
 
 
@@ -477,11 +484,12 @@ void Cmd_Move_Vel(float vx_mps, float vy_mps, float vz_rad_s)
  *    • dyaw:   |dyaw| < M_PI (3.14)，不要正好 ±M_PI
  *    • speed:  0.05 ~ 0.5 之间比较好
  *
- *  完整帧布局（共 21 字节，协议层 SI ×10000）：
+ *  完整帧布局（共 22 字节，协议层 SI ×10000）：
  *    [6..9]    radius_m  s32 LE  ×10000   圆弧半径 (m)
  *    [10..13]  dyaw_rad  s32 LE  ×10000   圆心角 (rad), CCW+
  *    [14..17]  speed     s32 LE  ×10000   线速度 (m/s), >0
- *    LEN = 12
+ *    [18]      profile   u8
+ *    LEN = 13
  *
  *  完成回传：A=0x6F, B=0x66
  *============================================================================*/
@@ -502,7 +510,10 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
         speed_mps *= 0.001f;
     }
 
-    if (speed_mps <= 0.0f) return;
+    if (speed_mps <= 0.0f) {
+        DFCom_MoveCommandSendFailed(CMD_ARC);
+        return;
+    }
     if (profile > 2) profile = 2;
 
     cnt = build_header(buf, 0x02, CMD_ARC);
@@ -518,8 +529,7 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
     buf[cnt++] = profile;                     /* ★ byte[12] = Profile */
 
     cnt = finalize_frame(buf, 13);
-    clear_move_slot(CMD_ARC);
-    send_frame(buf, cnt);
+    send_motion_frame(buf, cnt, CMD_ARC);
 }
 
 
@@ -551,7 +561,7 @@ void Cmd_Move_Arc(float radius_m, float dyaw_rad, float speed_mps, u8 profile)
  *    所以本函数对 ODOM_MODE_STOP 内部转成 ONESHOT (0x02) 发出去——小车收到后
  *    把 Visit_Type 改成 0x02，发完下一帧自动清零，从此不再推。
  *============================================================================*/
-void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz)
+void Cmd_Subscribe_Odom(u8 mode, u16 freq_hz)
 {
     /* Hz → 小车端枚举值 */
     u8 fcode;
@@ -580,7 +590,7 @@ void Cmd_Subscribe_Odom(u8 mode, u8 freq_hz)
     send_frame(buf, cnt);
 }
 
-void Cmd_Subscribe_VelPos(u8 mode, u8 freq_hz)
+void Cmd_Subscribe_VelPos(u8 mode, u16 freq_hz)
 {
     /* Hz → 小车端枚举值 */
     u8 fcode;

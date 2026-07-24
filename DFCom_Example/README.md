@@ -1,6 +1,6 @@
 # DcarON DFCom 客户端例程（精简教学版）
 
-> 给 STM32F103ZET6 用的小车通信库，3 个文件玩转 DcarON。
+> 面向 STM32F103C8T6 的完整小车例程，通信核心集中在 3 个 DFCom 文件。
 > **协议版本**：SI 单位 + ROS REP-103 坐标系（与老版本不兼容！）
 > **默认入参单位**：厘米 + 度（学生友好；可一键切到 SI 米/弧度）
 > 官网：<https://differ-tech.pages.dev/>
@@ -16,7 +16,7 @@
 
 ## 硬件接线
 
-| STM32F103ZET6 引脚 | 接到 | 波特率 | 用途 |
+| STM32F103C8T6 引脚 | 接到 | 波特率 | 用途 |
 |---|---|---|---|
 | **PA9** (TX) / **PA10** (RX) | DcarON 小车 UART | 460800 | 控制指令 + ODOM 数据回传 |
 | **PA2** (TX) / **PA3** (RX) | USB-TTL → 电脑 | 115200 | 终端看 ODOM 数据 |
@@ -57,6 +57,10 @@ DFCom_Example/
    ...
    ```
 7. 改 `main.c` 里 `while(1)` 里的指令，让小车做你想做的动作
+
+例程上电后会先进入运动回传隔离态，立即发一次零速度；等待 DCar 供电稳定
+1 秒后再发一次零速度。启动诊断结束并再留 50 ms 隔离窗口后，才清空 A/B
+任务槽并执行正式指令，避免上电前后的旧运动回传污染第一条任务。
 
 ## ★ 坐标系与单位约定（重要！）
 
@@ -146,8 +150,8 @@ void Cmd_Move_Vel           (float vx_mps, float vy_mps, float vz_rad_s);
 void Cmd_Move_Arc           (float radius_m, float dyaw_rad, float speed_mps, u8 profile);
 
 /* 订阅 Odom / VelPos 数据 */
-void Cmd_Subscribe_Odom     (u8 mode, u8 freq_hz);
-void Cmd_Subscribe_VelPos   (u8 mode, u8 freq_hz);
+void Cmd_Subscribe_Odom     (u8 mode, u16 freq_hz);
+void Cmd_Subscribe_VelPos   (u8 mode, u16 freq_hz);
 ```
 
 ### ODOM 订阅模式
@@ -183,16 +187,25 @@ g_odom.frame_count   // 总帧数（用来判数据流是不是活的）
 ### 等运动完成（可选）
 
 ```c
-WaitMoveDone(CMD_LINEAR, 5000)            // 等直线位移指令完成，超时 5 秒
-WaitMoveDone(CMD_LINEAR_WITH_YAW, 5000)   // 等无头位移
-WaitMoveDone(CMD_ARC, 10000)              // 等圆弧
-WaitMoveDone(CMD_ROT, 3000)               // 等旋转
+WaitMoveDone(CMD_LINEAR, 1000)            // 最多执行 1 秒；提前完成就提前返回
+WaitMoveDone(CMD_LINEAR_WITH_YAW, 1000)
+WaitMoveDone(CMD_ARC, 1000)
+WaitMoveDone(CMD_ROT, 1000)
+WaitMoveDone(CMD_ROT, 0)                  // 0 才表示永久等待
 
 // CMD_VEL 持续速度没有完成回传，不能用 WaitMoveDone
 
 // 不阻塞的进度查询（适合做 UI 进度条）
 u8 prog = GetMoveProgress(CMD_LINEAR);    // 0~254 进度, 255=完成
 ```
+
+超时不是“任务完成”，而是放行调用者发送下一条运动命令；下一条会按 DFLink
+协议合法打断上一条。客户端用 A/B 两个槽按发送次序交替：旧任务槽只吞掉旧
+进度和它唯一的 `0xFF` 终止帧，不会拿旧 `FF` 完成新任务；轮到 N+2 时即使
+旧终止帧曾丢失，也会无条件清零复用该槽。
+
+由于回传不含 task id，旧终止帧真的丢失时，同命令码的模糊 `FF` 会按安全侧
+丢弃：最坏是当前等待走满上限，不会错误提前跳过动作。
 
 ## 三个等级的用法示例（默认 CM 模式）
 
@@ -214,9 +227,9 @@ while (1) {
 ```c
 while (1) {
     Cmd_Move_Linear(50, 0, 30, 2);       // +X 前进 50 cm, 30 cm/s
-    WaitMoveDone(CMD_LINEAR, 5000);   // 等小车真到位
+    WaitMoveDone(CMD_LINEAR, 1000);       // 到位即返回，否则最多执行 1 秒
     Cmd_Move_Linear(0, 50, 30, 2);       // +Y 左移 50 cm
-    WaitMoveDone(CMD_LINEAR, 5000);
+    WaitMoveDone(CMD_LINEAR, 1000);
 }
 ```
 
@@ -296,9 +309,9 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 |---|---|---|---|
 | 0x62 | Motion_Velocity     | 12 | Vx + Vy + Vz_rad_s (3 × s32 ×10000) |
 | 0x63 | Motion_Rotate       |  8 | dYaw_rad + omega_max_rad_s (2 × s32 ×10000) |
-| 0x64 | Motion_Linear       | 12 | Px + Py + Speed (3 × s32 ×10000) |
-| 0x65 | Motion_LinearWithYaw| 16 | Px + Py + dYaw_rad + Speed (4 × s32 ×10000) |
-| 0x66 | Motion_Arc          | 12 | R + dYaw_rad + Speed (3 × s32 ×10000) |
+| 0x64 | Motion_Linear       | 13 | Px + Py + Speed (3 × s32 ×10000) + Profile (u8) |
+| 0x65 | Motion_LinearWithYaw| 17 | Px + Py + dYaw_rad + Speed (4 × s32 ×10000) + Profile (u8) |
+| 0x66 | Motion_Arc          | 13 | R + dYaw_rad + Speed (3 × s32 ×10000) + Profile (u8) |
 
 完整 A/B 对照表见 `DFCom.h` 顶部宏定义。
 
@@ -308,7 +321,7 @@ Cmd_Move_Vel(0, 0, 0);                         // 主动停车
 
 ```
 ============================================
-  DcarON DFCom Client - STM32F103ZET6
+  DcarON DFCom Client - STM32F103C8T6
   Protocol: SI + ROS REP-103 (+X fwd, +Y left)
   https://differ-tech.pages.dev/
 ============================================

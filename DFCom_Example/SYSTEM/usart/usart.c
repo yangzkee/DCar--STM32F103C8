@@ -221,20 +221,33 @@ void USART1_IRQHandler(void)
  * ===========================================================================*/
 u8 USART1_Send_By_DMA(u8 *data, u8 size)
 {
+    u32 start_tick;
+    u32 spin_guard;
+    u8 i;
+
     if (data == 0 || size == 0 || size > 100) return 1;
 
-    /* 等上一次 DMA 发完（最多 10ms） */
-    u32 timeout = 10000;
-    while (DMA_GetFlagStatus(DMA1_FLAG_TC4) == RESET && timeout--);
-    if (timeout == 0) {
-        DMA_Cmd(DMA1_Channel4, DISABLE);
-        return 1;
+    /*
+     * 只有 Channel4 正在工作时才等上一帧。
+     * 初始化后 Channel4 是 DISABLE，TC4 也还没有置位；旧代码此时无条件
+     * 等 TC4，导致上电后的第一帧永远先超时，连续重试也发不出去。
+     */
+    if ((DMA1_Channel4->CCR & DMA_CCR4_EN) != 0) {
+        start_tick = g_local_tick_ms;
+        spin_guard = 720000;  /* tick 尚未启动/中断被关时的兜底，避免永久卡死 */
+
+        while (DMA_GetFlagStatus(DMA1_FLAG_TC4) == RESET) {
+            if ((g_local_tick_ms - start_tick) >= 10 || spin_guard-- == 0) {
+                DMA_Cmd(DMA1_Channel4, DISABLE);
+                DMA_ClearFlag(DMA1_FLAG_GL4);
+                return 1;
+            }
+        }
     }
 
-    DMA_ClearFlag(DMA1_FLAG_TC4);
     DMA_Cmd(DMA1_Channel4, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_GL4);
 
-    u8 i;
     for (i = 0; i < size; i++) USART1_TX_BUFF[i] = data[i];
 
     DMA1_Channel4->CMAR = (uint32_t)USART1_TX_BUFF;
